@@ -134,12 +134,28 @@ func newRequest(req *http.Request, req_url *url.URL) *http.Request {
 	return new_req
 }
 
-func roundTrip(req *http.Request, transport http.RoundTripper, res_chan chan<- *http.Response, err_chan chan<- error) {
+func requestToPrimary(req *http.Request, id EndPointId, endpoint EndPoint, res_chan chan<- *http.Response, err_chan chan<- error) {
+	transport := http.DefaultTransport
 	res, err := transport.RoundTrip(req)
 	if err == nil {
 		res_chan <- res
 	} else {
+		errorLog(fmt.Sprintf("Error response from [%s]:[%s] -> %s", id, endpoint, err.Error()))
 		err_chan <- err
+	}
+}
+
+func requestToSecondary(req *http.Request, id EndPointId, endpoint EndPoint) {
+	transport := http.DefaultTransport
+	if res, err := transport.RoundTrip(req); err != nil {
+		errorLog(fmt.Sprintf("Error response from [%s]:[%s] -> %s", id, endpoint, err.Error()))
+	} else {
+		defer res.Body.Close()
+		if r, e := ioutil.ReadAll(res.Body); e != nil {
+			errorLog(e.Error())
+		} else {
+			infoLog(string(r))
+		}
 	}
 }
 
@@ -154,26 +170,14 @@ func broadcastHandler(config *BroadcastConfig) http.HandlerFunc {
 		res_chan := make(chan *http.Response)
 		err_chan := make(chan error)
 
-		transport := http.DefaultTransport
 		primary_endpoint_id := config.Options[PRIMARY]
 		for id, endpoint := range config.Backends {
 			request := newRequest(req, endpoint)
 			switch id {
 			case primary_endpoint_id:
-				go roundTrip(request, transport, res_chan, err_chan)
+				go requestToPrimary(request, id, endpoint, res_chan, err_chan)
 			default:
-				go func() {
-					if res, err := transport.RoundTrip(request); err != nil {
-						errorLog(fmt.Sprintf("Error response from [%s]:[%s] -> %s", id, endpoint, err.Error()))
-					} else {
-						defer res.Body.Close()
-						if r, e := ioutil.ReadAll(res.Body); e != nil {
-							errorLog(e.Error())
-						} else {
-							infoLog(string(r))
-						}
-					}
-				}()
+				go requestToSecondary(request, id, endpoint)
 			}
 		}
 
