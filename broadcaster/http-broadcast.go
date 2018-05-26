@@ -1,9 +1,11 @@
 package broadcaster
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -151,10 +153,18 @@ func requestToSecondary(req *http.Request, id EndPointId, endpoint EndPoint) {
 		errorLog(fmt.Sprintf("Error response from [%s]:[%s] -> %s", id, endpoint, err.Error()))
 	} else {
 		defer res.Body.Close()
-		if r, e := ioutil.ReadAll(res.Body); e != nil {
-			errorLog(e.Error())
-		} else {
-			infoLog(string(r))
+		var buf bytes.Buffer
+		writer := bufio.NewWriter(&buf)
+		io.Copy(writer, res.Body)
+		writer.Flush()
+		infoLog(buf.String())
+	}
+}
+
+func copyHeader(dst, src http.Header) {
+	for k, vv := range src {
+		for _, v := range vv {
+			dst.Add(k, v)
 		}
 	}
 }
@@ -162,6 +172,19 @@ func requestToSecondary(req *http.Request, id EndPointId, endpoint EndPoint) {
 func readResponseTimeout(config *BroadcastConfig) time.Duration {
 	n, _ := strconv.Atoi(config.Options[RESPONSE_TIMEOUT_IN_SECS])
 	return time.Duration(n) * time.Second
+}
+
+func copyResponse(rw http.ResponseWriter, res *http.Response) {
+	copyHeader(rw.Header(), res.Header)
+	rw.WriteHeader(res.StatusCode)
+	defer res.Body.Close()
+	buf := make([]byte, 32*1024)
+	if _, err := io.CopyBuffer(rw, res.Body, buf); err != nil {
+		fmt.Fprintln(rw, string(err.Error()))
+	}
+	if f, ok := rw.(http.Flusher); ok {
+		f.Flush()
+	}
 }
 
 func broadcastHandler(config *BroadcastConfig) http.HandlerFunc {
@@ -184,17 +207,11 @@ func broadcastHandler(config *BroadcastConfig) http.HandlerFunc {
 		response_timeout := readResponseTimeout(config)
 		select {
 		case res := <-res_chan:
-			defer res.Body.Close()
-			r, e := ioutil.ReadAll(res.Body)
-			if e == nil {
-				fmt.Fprintln(rw, string(r))
-			} else {
-				fmt.Fprintln(rw, string(e.Error()))
-			}
+			copyResponse(rw, res)
 		case err := <-err_chan:
 			fmt.Fprintln(rw, string(err.Error()))
 		case <-time.After(response_timeout):
-			fmt.Fprintln(rw, "Timeout")
+			fmt.Fprintln(rw, "Timeout") //TODO Handle this correctly
 		}
 	})
 }
