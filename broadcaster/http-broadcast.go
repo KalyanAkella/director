@@ -105,6 +105,16 @@ var (
 	}
 )
 
+func copyQueryParams(src *url.URL, dest *url.URL) {
+	dest_query := dest.Query()
+	for k, vs := range src.Query() {
+		for _, v := range vs {
+			dest_query.Set(k, v)
+		}
+	}
+	dest.RawQuery = dest_query.Encode()
+}
+
 func newRequest(req *http.Request, req_url *url.URL) *http.Request {
 	new_req := req.WithContext(context.Background())
 
@@ -112,14 +122,8 @@ func newRequest(req *http.Request, req_url *url.URL) *http.Request {
 		new_req.Body = nil
 	}
 	new_req.Header = cloneHeader(req.Header)
+	copyQueryParams(req.URL, req_url)
 	new_req.URL = req_url
-	new_query := new_req.URL.Query()
-	for k, vs := range req.URL.Query() {
-		for _, v := range vs {
-			new_query.Set(k, v)
-		}
-	}
-	new_req.URL.RawQuery = new_query.Encode()
 	new_req.Close = false
 
 	// Remove hop-by-hop headers listed in the "Connection" header.
