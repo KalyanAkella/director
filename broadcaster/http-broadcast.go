@@ -113,6 +113,13 @@ func newRequest(req *http.Request, req_url *url.URL) *http.Request {
 	}
 	new_req.Header = cloneHeader(req.Header)
 	new_req.URL = req_url
+	new_query := new_req.URL.Query()
+	for k, vs := range req.URL.Query() {
+		for _, v := range vs {
+			new_query.Set(k, v)
+		}
+	}
+	new_req.URL.RawQuery = new_query.Encode()
 	new_req.Close = false
 
 	// Remove hop-by-hop headers listed in the "Connection" header.
@@ -189,13 +196,14 @@ func copyResponse(rw http.ResponseWriter, res *http.Response) {
 
 func broadcastHandler(config *BroadcastConfig) http.HandlerFunc {
 	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
-
+		infoLog("Received request: " + req.URL.String())
 		res_chan := make(chan *http.Response)
 		err_chan := make(chan error)
 
 		primary_endpoint_id := config.Options[PRIMARY]
 		for id, endpoint := range config.Backends {
 			request := newRequest(req, endpoint)
+			infoLog("Sending request: " + request.URL.String())
 			switch id {
 			case primary_endpoint_id:
 				go requestToPrimary(request, id, endpoint, res_chan, err_chan)
