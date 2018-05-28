@@ -6,7 +6,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"testing"
 )
 
@@ -14,15 +13,6 @@ func BenchmarkHTTPBroadcast(b *testing.B) {
 	b.ResetTimer()
 	// b.RunParallel(...)
 	for i := 0; i < b.N; i++ {
-	}
-}
-
-func asUrl(urlString string) *url.URL {
-	aUrl, err := url.Parse(urlString)
-	if err != nil {
-		panic(err)
-	} else {
-		return aUrl
 	}
 }
 
@@ -92,7 +82,7 @@ func TestHTTPBroadcast(t *testing.T) {
 	for t, e := range backendServers {
 		server := newServer(t, e, res_chan)
 		defer server.Close()
-		backends[t] = asUrl(fmt.Sprintf("http://%s", e))
+		backends[t] = fmt.Sprintf("http://%s", e)
 	}
 
 	// When

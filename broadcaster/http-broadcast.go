@@ -16,21 +16,22 @@ import (
 )
 
 type (
-	BroadcastOption  = byte
+	BroadcastOption  = string
 	BroadcastOptions = map[BroadcastOption]string
 	EndPointId       = string
-	EndPoint         = *url.URL
+	EndPoint         = string
 	EndPoints        = map[EndPointId]EndPoint
 	BroadcastConfig  = struct {
 		Options  BroadcastOptions
 		Backends EndPoints
+		backends map[EndPointId]*url.URL
 	}
 )
 
 const (
-	PORT BroadcastOption = iota
-	PRIMARY
-	RESPONSE_TIMEOUT_IN_SECS
+	PORT                     BroadcastOption = "Port"
+	PRIMARY                  BroadcastOption = "PrimaryEndpoint"
+	RESPONSE_TIMEOUT_IN_SECS BroadcastOption = "ResponseTimeoutInSecs"
 )
 
 func broadcastError(msg string) error {
@@ -58,13 +59,21 @@ func validate(config *BroadcastConfig) error {
 	}
 	if config.Backends == nil || len(config.Backends) == 0 {
 		return broadcastError("Backends are missing or empty")
+	} else {
+		config.backends = make(map[EndPointId]*url.URL)
 	}
 	if _, present := config.Backends[config.Options[PRIMARY]]; !present {
 		return broadcastError("Primary backend missing from the given set of backends")
 	}
 	for k, v := range config.Backends {
-		if v == nil {
+		if v == "" {
 			return broadcastError(fmt.Sprintf("Backend endpoint with ID: %s does not have any associated data", k))
+		} else {
+			if backend_url, err := url.Parse(v); err != nil {
+				return broadcastError(fmt.Sprintf("Invalid url: %s for endpoint with ID: %s. Error: %s", v, k, err.Error()))
+			} else {
+				config.backends[k] = backend_url
+			}
 		}
 	}
 	return nil
@@ -164,7 +173,7 @@ func newRequest(req *http.Request, req_url *url.URL) *http.Request {
 	return new_req
 }
 
-func requestToPrimary(req *http.Request, id EndPointId, endpoint EndPoint, res_chan chan<- *http.Response, err_chan chan<- error) {
+func requestToPrimary(req *http.Request, id EndPointId, endpoint *url.URL, res_chan chan<- *http.Response, err_chan chan<- error) {
 	transport := http.DefaultTransport
 	res, err := transport.RoundTrip(req)
 	if err == nil {
@@ -175,7 +184,7 @@ func requestToPrimary(req *http.Request, id EndPointId, endpoint EndPoint, res_c
 	}
 }
 
-func requestToSecondary(req *http.Request, id EndPointId, endpoint EndPoint) {
+func requestToSecondary(req *http.Request, id EndPointId, endpoint *url.URL) {
 	transport := http.DefaultTransport
 	if res, err := transport.RoundTrip(req); err != nil {
 		errorLog(fmt.Sprintf("Error response from [%s]:[%s] -> %s", id, endpoint, err.Error()))
@@ -222,7 +231,7 @@ func broadcastHandler(config *BroadcastConfig) http.HandlerFunc {
 		err_chan := make(chan error)
 
 		primary_endpoint_id := config.Options[PRIMARY]
-		for id, endpoint := range config.Backends {
+		for id, endpoint := range config.backends {
 			request := newRequest(req, endpoint)
 			infoLog("Sending request: " + request.URL.String())
 			switch id {
