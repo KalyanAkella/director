@@ -22,8 +22,8 @@ type (
 	EndPoint         = string
 	EndPoints        = map[EndPointId]EndPoint
 	BroadcastConfig  = struct {
-		Options  BroadcastOptions
-		Backends EndPoints
+		Options  BroadcastOptions `yaml:"Options,omitempty"`
+		Backends EndPoints        `yaml:"Backends,omitempty"`
 		backends map[EndPointId]*url.URL
 	}
 )
@@ -32,6 +32,7 @@ const (
 	PORT                     BroadcastOption = "Port"
 	PRIMARY                  BroadcastOption = "PrimaryEndpoint"
 	RESPONSE_TIMEOUT_IN_SECS BroadcastOption = "ResponseTimeoutInSecs"
+	BROADCAST_LOG            BroadcastOption = "BroadcastLogFile"
 )
 
 func broadcastError(msg string) error {
@@ -53,6 +54,9 @@ func validate(config *BroadcastConfig) error {
 	}
 	if _, present := config.Options[RESPONSE_TIMEOUT_IN_SECS]; !present {
 		return broadcastError("Response timeout is missing in broadcast options")
+	}
+	if path, present := config.Options[BROADCAST_LOG]; present {
+		setLogDestination(path)
 	}
 	if _, err := strconv.Atoi(config.Options[RESPONSE_TIMEOUT_IN_SECS]); err != nil {
 		return broadcastError(err.Error())
@@ -113,6 +117,15 @@ var (
 		"Upgrade",
 	}
 )
+
+func setLogDestination(broadcastLogFile string) {
+	if logFile, err := os.OpenFile(broadcastLogFile, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644); err == nil {
+		infoLog(fmt.Sprintf("Logging to %s...", broadcastLogFile))
+		logger.SetOutput(logFile)
+	} else {
+		errorLog(err.Error())
+	}
+}
 
 func singleJoiningSlash(a, b string) string {
 	aslash := strings.HasSuffix(a, "/")
