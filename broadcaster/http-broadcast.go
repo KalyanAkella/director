@@ -105,14 +105,32 @@ var (
 	}
 )
 
-func copyQueryParams(src *url.URL, dest *url.URL) {
-	dest_query := dest.Query()
-	for k, vs := range src.Query() {
-		for _, v := range vs {
-			dest_query.Set(k, v)
-		}
+func singleJoiningSlash(a, b string) string {
+	aslash := strings.HasSuffix(a, "/")
+	slashb := strings.HasPrefix(b, "/")
+	switch {
+	case aslash && slashb:
+		return a + b[1:]
+	case !aslash && !slashb:
+		return a + "/" + b
 	}
-	dest.RawQuery = dest_query.Encode()
+	return a + b
+}
+
+func modifyRequestForBroadcast(out_req *http.Request, target *url.URL) {
+	targetQuery := target.RawQuery
+	out_req.URL.Scheme = target.Scheme
+	out_req.URL.Host = target.Host
+	out_req.URL.Path = singleJoiningSlash(target.Path, out_req.URL.Path)
+	if targetQuery == "" || out_req.URL.RawQuery == "" {
+		out_req.URL.RawQuery = targetQuery + out_req.URL.RawQuery
+	} else {
+		out_req.URL.RawQuery = targetQuery + "&" + out_req.URL.RawQuery
+	}
+	if _, ok := out_req.Header["User-Agent"]; !ok {
+		// explicitly disable User-Agent so it's not set to default value
+		out_req.Header.Set("User-Agent", "")
+	}
 }
 
 func newRequest(req *http.Request, req_url *url.URL) *http.Request {
@@ -122,8 +140,7 @@ func newRequest(req *http.Request, req_url *url.URL) *http.Request {
 		new_req.Body = nil
 	}
 	new_req.Header = cloneHeader(req.Header)
-	copyQueryParams(req.URL, req_url)
-	new_req.URL = req_url
+	modifyRequestForBroadcast(new_req, req_url)
 	new_req.Close = false
 
 	// Remove hop-by-hop headers listed in the "Connection" header.
