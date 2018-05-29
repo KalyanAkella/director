@@ -21,18 +21,44 @@ type (
 	EndPointId       = string
 	EndPoint         = string
 	EndPoints        = map[EndPointId]EndPoint
-	BroadcastConfig  = struct {
-		Options  BroadcastOptions `yaml:"Options,omitempty"`
-		Backends EndPoints        `yaml:"Backends,omitempty"`
-		backends map[EndPointId]*url.URL
-	}
 )
+
+type BroadcastConfig struct {
+	Options  BroadcastOptions `yaml:"Options,omitempty"`
+	Backends EndPoints        `yaml:"Backends,omitempty"`
+	backends map[EndPointId]*url.URL
+}
 
 const (
 	PORT                     BroadcastOption = "Port"
 	PRIMARY                  BroadcastOption = "PrimaryEndpoint"
 	RESPONSE_TIMEOUT_IN_SECS BroadcastOption = "ResponseTimeoutInSecs"
 	BROADCAST_LOG            BroadcastOption = "BroadcastLogFile"
+)
+
+var (
+	logger  = log.New(os.Stdout, "", log.Ldate|log.Ltime|log.Lshortfile)
+	infoLog = func(msg string) {
+		logger.SetPrefix("INFO:")
+		logger.Println(msg)
+	}
+	errorLog = func(msg string) {
+		logger.SetPrefix("ERROR:")
+		logger.Println(msg)
+	}
+	// Hop-by-hop headers. These are removed when sent to the backend.
+	// http://www.w3.org/Protocols/rfc2616/rfc2616-sec13.html
+	hopHeaders = []string{
+		"Connection",
+		"Proxy-Connection", // non-standard but still sent by libcurl and rejected by e.g. google
+		"Keep-Alive",
+		"Proxy-Authenticate",
+		"Proxy-Authorization",
+		"Te",      // canonicalized version of "TE"
+		"Trailer", // not Trailers per URL above; http://www.rfc-editor.org/errata_search.php?eid=4522
+		"Transfer-Encoding",
+		"Upgrade",
+	}
 )
 
 func broadcastError(msg string) error {
@@ -92,31 +118,6 @@ func cloneHeader(h http.Header) http.Header {
 	}
 	return h2
 }
-
-var (
-	logger  = log.New(os.Stdout, "", log.Ldate|log.Ltime|log.Lshortfile)
-	infoLog = func(msg string) {
-		logger.SetPrefix("INFO:")
-		logger.Println(msg)
-	}
-	errorLog = func(msg string) {
-		logger.SetPrefix("ERROR:")
-		logger.Println(msg)
-	}
-	// Hop-by-hop headers. These are removed when sent to the backend.
-	// http://www.w3.org/Protocols/rfc2616/rfc2616-sec13.html
-	hopHeaders = []string{
-		"Connection",
-		"Proxy-Connection", // non-standard but still sent by libcurl and rejected by e.g. google
-		"Keep-Alive",
-		"Proxy-Authenticate",
-		"Proxy-Authorization",
-		"Te",      // canonicalized version of "TE"
-		"Trailer", // not Trailers per URL above; http://www.rfc-editor.org/errata_search.php?eid=4522
-		"Transfer-Encoding",
-		"Upgrade",
-	}
-)
 
 func setLogDestination(broadcastLogFile string) {
 	if logFile, err := os.OpenFile(broadcastLogFile, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644); err == nil {
@@ -267,16 +268,43 @@ func broadcastHandler(config *BroadcastConfig) http.HandlerFunc {
 	})
 }
 
-func BroadcastHTTPHandler(config *BroadcastConfig) (http.HandlerFunc, error) {
-	if err := validate(config); err != nil {
-		return nil, err
-	}
-	return broadcastHandler(config), nil
+type MetricsReporter interface {
+	Increment(tag string)
+	Gauge(tag string, value interface{})
+	Count(tag string, value interface{})
+	Time(tag string)
 }
 
-func ServeOnHTTP(config *BroadcastConfig) error {
-	if err := validate(config); err != nil {
-		return err
+type NoOpReporter struct{}
+
+func (r *NoOpReporter) Increment(tag string)                {}
+func (r *NoOpReporter) Gauge(tag string, value interface{}) {}
+func (r *NoOpReporter) Count(tag string, value interface{}) {}
+func (r *NoOpReporter) Time(tag string)                     {}
+
+type Broadcaster struct {
+	Handler  http.HandlerFunc
+	reporter MetricsReporter
+	config   *BroadcastConfig
+}
+
+func NewBroadcaster(broadcastConfig *BroadcastConfig) (*Broadcaster, error) {
+	if err := validate(broadcastConfig); err != nil {
+		return nil, err
 	}
-	return http.ListenAndServe(fmt.Sprintf(":%s", config.Options[PORT]), broadcastHandler(config))
+	return &Broadcaster{
+		Handler:  broadcastHandler(broadcastConfig),
+		reporter: &NoOpReporter{},
+		config:   broadcastConfig,
+	}, nil
+}
+
+func (b *Broadcaster) WithMetricsReporter(reporter MetricsReporter) {
+	if reporter != nil {
+		b.reporter = reporter
+	}
+}
+
+func (b *Broadcaster) ListenAndServe() error {
+	return http.ListenAndServe(fmt.Sprintf(":%s", b.config.Options[PORT]), b.Handler)
 }

@@ -86,7 +86,7 @@ func TestHTTPBroadcast(t *testing.T) {
 	}
 
 	// When
-	if broadcast_handler, err := BroadcastHTTPHandler(&BroadcastConfig{
+	if broadcaster, err := NewBroadcaster(&BroadcastConfig{
 		Backends: backends,
 		Options: map[BroadcastOption]string{
 			PORT:                     BroadcastServerPort,
@@ -96,7 +96,7 @@ func TestHTTPBroadcast(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	} else {
-		broadcast_server := newBroadcastServer(broadcast_handler)
+		broadcast_server := newBroadcastServer(broadcaster.Handler)
 		defer broadcast_server.Close()
 	}
 
