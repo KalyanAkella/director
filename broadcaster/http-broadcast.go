@@ -154,6 +154,7 @@ func modifyRequestForBroadcast(out_req *http.Request, target *url.URL) {
 		// explicitly disable User-Agent so it's not set to default value
 		out_req.Header.Set("User-Agent", "")
 	}
+	out_req.Host = ""
 }
 
 func newRequest(req *http.Request, req_url *url.URL) *http.Request {
@@ -190,8 +191,8 @@ func newRequest(req *http.Request, req_url *url.URL) *http.Request {
 func requestToPrimary(req *http.Request, id EndPointId, endpoint *url.URL, res_chan chan<- *http.Response, err_chan chan<- error, reporter MetricsReporter) {
 	defer reporter.Time("primary.response_time")
 	transport := http.DefaultTransport
-	res, err := transport.RoundTrip(req)
-	if err == nil {
+	if res, err := transport.RoundTrip(req); err == nil {
+		infoLog(fmt.Sprintf("Received response with status %d", res.StatusCode))
 		reporter.Increment("primary.success.count")
 		res_chan <- res
 	} else {
@@ -204,10 +205,8 @@ func requestToPrimary(req *http.Request, id EndPointId, endpoint *url.URL, res_c
 func requestToSecondary(req *http.Request, id EndPointId, endpoint *url.URL, reporter MetricsReporter) {
 	defer reporter.Time("secondary.response_time")
 	transport := http.DefaultTransport
-	if res, err := transport.RoundTrip(req); err != nil {
-		reporter.Increment("secondary.failure.count")
-		errorLog(fmt.Sprintf("Error response from [%s]:[%s] -> %s", id, endpoint, err.Error()))
-	} else {
+	if res, err := transport.RoundTrip(req); err == nil {
+		infoLog(fmt.Sprintf("Received response with status %d", res.StatusCode))
 		reporter.Increment("secondary.success.count")
 		defer res.Body.Close()
 		var buf bytes.Buffer
@@ -215,6 +214,9 @@ func requestToSecondary(req *http.Request, id EndPointId, endpoint *url.URL, rep
 		io.Copy(writer, res.Body)
 		writer.Flush()
 		infoLog(buf.String())
+	} else {
+		reporter.Increment("secondary.failure.count")
+		errorLog(fmt.Sprintf("Error response from [%s]:[%s] -> %s", id, endpoint, err.Error()))
 	}
 }
 
