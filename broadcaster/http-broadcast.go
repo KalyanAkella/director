@@ -187,22 +187,28 @@ func newRequest(req *http.Request, req_url *url.URL) *http.Request {
 	return new_req
 }
 
-func requestToPrimary(req *http.Request, id EndPointId, endpoint *url.URL, res_chan chan<- *http.Response, err_chan chan<- error) {
+func requestToPrimary(req *http.Request, id EndPointId, endpoint *url.URL, res_chan chan<- *http.Response, err_chan chan<- error, reporter MetricsReporter) {
+	defer reporter.Time("primary.response_time")
 	transport := http.DefaultTransport
 	res, err := transport.RoundTrip(req)
 	if err == nil {
+		reporter.Increment("primary.success.count")
 		res_chan <- res
 	} else {
+		reporter.Increment("primary.failure.count")
 		errorLog(fmt.Sprintf("Error response from [%s]:[%s] -> %s", id, endpoint, err.Error()))
 		err_chan <- err
 	}
 }
 
-func requestToSecondary(req *http.Request, id EndPointId, endpoint *url.URL) {
+func requestToSecondary(req *http.Request, id EndPointId, endpoint *url.URL, reporter MetricsReporter) {
+	defer reporter.Time("secondary.response_time")
 	transport := http.DefaultTransport
 	if res, err := transport.RoundTrip(req); err != nil {
+		reporter.Increment("secondary.failure.count")
 		errorLog(fmt.Sprintf("Error response from [%s]:[%s] -> %s", id, endpoint, err.Error()))
 	} else {
+		reporter.Increment("secondary.success.count")
 		defer res.Body.Close()
 		var buf bytes.Buffer
 		writer := bufio.NewWriter(&buf)
@@ -238,34 +244,34 @@ func copyResponse(rw http.ResponseWriter, res *http.Response) {
 	}
 }
 
-func broadcastHandler(config *BroadcastConfig) http.HandlerFunc {
-	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
-		infoLog("Received request: " + req.URL.String())
-		res_chan := make(chan *http.Response)
-		err_chan := make(chan error)
+func (b *Broadcaster) handler(rw http.ResponseWriter, req *http.Request) {
+	b.reporter.Increment("broadcaster.request.count")
+	infoLog("Received request: " + req.URL.String())
+	res_chan := make(chan *http.Response)
+	err_chan := make(chan error)
 
-		primary_endpoint_id := config.Options[PRIMARY]
-		for id, endpoint := range config.backends {
-			request := newRequest(req, endpoint)
-			infoLog("Sending request: " + request.URL.String())
-			switch id {
-			case primary_endpoint_id:
-				go requestToPrimary(request, id, endpoint, res_chan, err_chan)
-			default:
-				go requestToSecondary(request, id, endpoint)
-			}
+	primary_endpoint_id := b.config.Options[PRIMARY]
+	for id, endpoint := range b.config.backends {
+		request := newRequest(req, endpoint)
+		infoLog("Sending request: " + request.URL.String())
+		switch id {
+		case primary_endpoint_id:
+			go requestToPrimary(request, id, endpoint, res_chan, err_chan, b.reporter)
+		default:
+			go requestToSecondary(request, id, endpoint, b.reporter)
 		}
+	}
 
-		response_timeout := readResponseTimeout(config)
-		select {
-		case res := <-res_chan:
-			copyResponse(rw, res)
-		case err := <-err_chan:
-			fmt.Fprintln(rw, string(err.Error()))
-		case <-time.After(response_timeout):
-			fmt.Fprintln(rw, "Timeout") //TODO Handle this correctly
-		}
-	})
+	response_timeout := readResponseTimeout(b.config)
+	select {
+	case res := <-res_chan:
+		copyResponse(rw, res)
+	case err := <-err_chan:
+		fmt.Fprintln(rw, string(err.Error()))
+	case <-time.After(response_timeout):
+		b.reporter.Increment("broadcaster.timeout.count")
+		fmt.Fprintln(rw, "Timeout") //TODO Handle this correctly
+	}
 }
 
 type MetricsReporter interface {
@@ -292,11 +298,13 @@ func NewBroadcaster(broadcastConfig *BroadcastConfig) (*Broadcaster, error) {
 	if err := validate(broadcastConfig); err != nil {
 		return nil, err
 	}
-	return &Broadcaster{
-		Handler:  broadcastHandler(broadcastConfig),
+
+	broadcaster := &Broadcaster{
 		reporter: &NoOpReporter{},
 		config:   broadcastConfig,
-	}, nil
+	}
+	broadcaster.Handler = http.HandlerFunc(broadcaster.handler)
+	return broadcaster, nil
 }
 
 func (b *Broadcaster) WithMetricsReporter(reporter MetricsReporter) {
