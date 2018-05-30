@@ -318,5 +318,5 @@ func (b *Broadcaster) WithMetricsReporter(reporter MetricsReporter) {
 }
 
 func (b *Broadcaster) ListenAndServe() error {
-	return http.ListenAndServe(fmt.Sprintf(":%s", b.config.Options.Port), b.Handler)
+	return http.ListenAndServe(fmt.Sprintf(":%d", b.config.Options.Port), b.Handler)
 }
