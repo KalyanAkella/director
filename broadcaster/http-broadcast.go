@@ -193,7 +193,8 @@ func newRequest(req *http.Request, req_url *url.URL) *http.Request {
 }
 
 func requestToPrimary(req *http.Request, id EndPointId, endpoint *url.URL, res_chan chan<- *http.Response, err_chan chan<- error, reporter MetricsReporter) {
-	defer reporter.Time("primary.response_time")
+	tc := reporter.StartTiming()
+	defer reporter.EndTiming(tc, "primary.response_time")
 	transport := http.DefaultTransport
 	if res, err := transport.RoundTrip(req); err == nil {
 		infoLog(fmt.Sprintf("Received response with status %d", res.StatusCode))
@@ -207,7 +208,8 @@ func requestToPrimary(req *http.Request, id EndPointId, endpoint *url.URL, res_c
 }
 
 func requestToSecondary(req *http.Request, id EndPointId, endpoint *url.URL, reporter MetricsReporter) {
-	defer reporter.Time("secondary.response_time")
+	tc := reporter.StartTiming()
+	defer reporter.EndTiming(tc, "secondary.response_time")
 	transport := http.DefaultTransport
 	if res, err := transport.RoundTrip(req); err == nil {
 		infoLog(fmt.Sprintf("Received response with status %d", res.StatusCode))
@@ -279,19 +281,26 @@ func (b *Broadcaster) handler(rw http.ResponseWriter, req *http.Request) {
 	}
 }
 
+type TimingContext struct {
+	Context interface{}
+}
+
 type MetricsReporter interface {
 	Increment(tag string)
 	Gauge(tag string, value interface{})
 	Count(tag string, value interface{})
-	Time(tag string)
+	StartTiming() *TimingContext
+	EndTiming(tc *TimingContext, tag string)
 }
 
 type NoOpReporter struct{}
 
-func (r *NoOpReporter) Increment(tag string)                {}
-func (r *NoOpReporter) Gauge(tag string, value interface{}) {}
-func (r *NoOpReporter) Count(tag string, value interface{}) {}
-func (r *NoOpReporter) Time(tag string)                     {}
+func (r *NoOpReporter) StartTiming() *TimingContext             { return nil }
+func (r *NoOpReporter) Increment(tag string)                    {}
+func (r *NoOpReporter) Gauge(tag string, value interface{})     {}
+func (r *NoOpReporter) Count(tag string, value interface{})     {}
+func (r *NoOpReporter) Time(tag string)                         {}
+func (r *NoOpReporter) EndTiming(tc *TimingContext, tag string) {}
 
 type Broadcaster struct {
 	Handler  http.HandlerFunc
