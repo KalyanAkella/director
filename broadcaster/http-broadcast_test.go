@@ -3,18 +3,12 @@ package broadcaster
 import (
 	"fmt"
 	"io/ioutil"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 )
-
-func BenchmarkHTTPBroadcast(b *testing.B) {
-	b.ResetTimer()
-	// b.RunParallel(...)
-	for i := 0; i < b.N; i++ {
-	}
-}
 
 func newListener(endpoint string) net.Listener {
 	if l, err := net.Listen("tcp", endpoint); err != nil {
@@ -48,12 +42,6 @@ const (
 	NumRequests         = 10
 )
 
-var backendServers = map[string]string{
-	"B1":       "localhost:9091",
-	PrimaryTag: "localhost:9092",
-	"B3":       "localhost:9093",
-}
-
 func readTag(response string) string {
 	var tag string
 	if _, err := fmt.Sscanf(response, "%s", &tag); err != nil {
@@ -75,52 +63,84 @@ func httpGet(url string) string {
 	}
 }
 
-func TestHTTPBroadcast(t *testing.T) {
-	// Given
-	res_chan := make(chan string, len(backendServers))
-	backends := make(map[EndPointId]EndPoint)
-	for t, e := range backendServers {
-		server := newServer(t, e, res_chan)
-		defer server.Close()
-		backends[t] = fmt.Sprintf("http://%s", e)
+func BenchmarkHTTPBroadcast(b *testing.B) {
+	b.ResetTimer()
+	// b.RunParallel(...)
+	for i := 0; i < b.N; i++ {
 	}
+}
 
-	// When
+var broadcast_server *httptest.Server
+var (
+	backendServers = map[string]string{
+		"B1":       "localhost:9091",
+		PrimaryTag: "localhost:9092",
+		"B3":       "localhost:9093",
+	}
+	backends = make([]*httptest.Server, len(backendServers))
+	res_chan = make(chan string, len(backendServers))
+)
+
+func startBackendServers() {
+	i := 0
+	for t, e := range backendServers {
+		backends[i] = newServer(t, e, res_chan)
+		backendServers[t] = fmt.Sprintf("http://%s", e)
+		i++
+	}
+}
+
+func startBroadcastServer() {
 	if broadcaster, err := NewBroadcaster(&BroadcastConfig{
-		Backends: backends,
+		Backends: backendServers,
 		Options: map[BroadcastOption]string{
 			PORT:                     BroadcastServerPort,
 			PRIMARY:                  PrimaryTag,
 			RESPONSE_TIMEOUT_IN_SECS: "10",
 		},
 	}); err != nil {
-		t.Fatal(err)
+		log.Fatal(err)
 	} else {
-		broadcast_server := newBroadcastServer(broadcaster.Handler)
-		defer broadcast_server.Close()
+		broadcast_server = newBroadcastServer(broadcaster.Handler)
 	}
+}
 
-	// Then
-	responded := make(map[string]int, len(backendServers))
-	for t := range backendServers {
-		responded[t] = 0
+func setup() {
+	startBackendServers()
+	startBroadcastServer()
+}
+
+func teardown() {
+	broadcast_server.Close()
+	for _, backend := range backends {
+		backend.Close()
 	}
-	for i := 1; i <= NumRequests; i++ {
-		broadcast_res := httpGet("http://localhost:9090")
-		if primary_tag := readTag(broadcast_res); primary_tag != PrimaryTag {
-			t.Errorf("Expected primary tag %s, Actual primary tag %s. Broadcast Response %s", PrimaryTag, primary_tag, broadcast_res)
-		}
-		for range backendServers {
-			select {
-			case msg := <-res_chan:
-				responded[readTag(msg)]++
-			default:
-			}
+}
+
+func testSingleBroadcastRequest(t *testing.T) {
+	responded := make(map[string]bool, len(backendServers))
+	broadcast_res := httpGet("http://localhost:9090")
+	if primary_tag := readTag(broadcast_res); primary_tag != PrimaryTag {
+		t.Errorf("Expected primary tag %s, Actual primary tag %s. Broadcast Response %s", PrimaryTag, primary_tag, broadcast_res)
+	}
+	for range backendServers {
+		select {
+		case msg := <-res_chan:
+			responded[readTag(msg)] = true
+		default:
 		}
 	}
 	for k, v := range responded {
-		if v < NumRequests {
+		if !v {
 			t.Errorf("No response from server with tag: %s", k)
 		}
+	}
+}
+
+func TestHTTPBroadcast(t *testing.T) {
+	setup()
+	defer teardown()
+	for i := 1; i <= NumRequests; i++ {
+		testSingleBroadcastRequest(t)
 	}
 }
