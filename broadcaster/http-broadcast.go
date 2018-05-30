@@ -175,22 +175,18 @@ func newRequest(req *http.Request, req_url *url.URL) *http.Request {
 	modifyRequestForBroadcast(new_req, req_url)
 	new_req.Close = false
 
-	// Remove hop-by-hop headers listed in the "Connection" header.
-	// See RFC 2616, section 14.10.
-	if c := new_req.Header.Get("Connection"); c != "" {
-		for _, f := range strings.Split(c, ",") {
-			if f = strings.TrimSpace(f); f != "" {
-				new_req.Header.Del(f)
-			}
-		}
-	}
-
-	// Remove hop-by-hop headers to the backend. Especially
-	// important is "Connection" because we want a persistent
-	// connection, regardless of what the client sent to us.
 	for _, h := range hopHeaders {
-		if new_req.Header.Get(h) != "" {
-			new_req.Header.Del(h)
+		v := new_req.Header.Get(h)
+		if v != "" {
+			if h == "Connection" {
+				for _, f := range strings.Split(v, ",") {
+					if f = strings.TrimSpace(f); f != "" {
+						new_req.Header.Del(f)
+					}
+				}
+			} else {
+				new_req.Header.Del(h)
+			}
 		}
 	}
 	return new_req
