@@ -10,42 +10,52 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 )
 
 type (
-	BroadcastOption  = string
-	BroadcastOptions = map[BroadcastOption]string
-	EndPointId       = string
-	EndPoint         = string
-	EndPoints        = map[EndPointId]EndPoint
+	EndPointId  = string
+	EndPoint    = string
+	EndPoints   = map[EndPointId]EndPoint
+	LoggerLevel = bool
 )
 
+type BroadcastOptions struct {
+	Port                  int         `yaml:"Port"`
+	PrimaryEndpoint       string      `yaml:"PrimaryEndpoint"`
+	ResponseTimeoutInSecs int         `yaml:"ResponseTimeoutInSecs"`
+	LogFile               string      `yaml:"LogFile"`
+	LogLevel              LoggerLevel `yaml:"EnableInfoLogs"`
+}
+
 type BroadcastConfig struct {
-	Options  BroadcastOptions `yaml:"Options,omitempty"`
-	Backends EndPoints        `yaml:"Backends,omitempty"`
+	Options  *BroadcastOptions `yaml:"Options,omitempty"`
+	Backends EndPoints         `yaml:"Backends,omitempty"`
 	backends map[EndPointId]*url.URL
 }
 
 const (
-	PORT                     BroadcastOption = "Port"
-	PRIMARY                  BroadcastOption = "PrimaryEndpoint"
-	RESPONSE_TIMEOUT_IN_SECS BroadcastOption = "ResponseTimeoutInSecs"
-	BROADCAST_LOG            BroadcastOption = "BroadcastLogFile"
+	ERROR LoggerLevel = false
+	INFO  LoggerLevel = true
 )
 
 var (
-	logger  = log.New(os.Stdout, "", log.Ldate|log.Ltime|log.Lshortfile)
+	currentLogLevel = ERROR
+	logger          = log.New(os.Stdout, "", log.Ldate|log.Ltime|log.Lshortfile)
+
 	infoLog = func(msg string) {
-		logger.SetPrefix("INFO:")
-		logger.Println(msg)
+		if currentLogLevel == INFO {
+			logger.SetPrefix("INFO:")
+			logger.Println(msg)
+		}
 	}
+
 	errorLog = func(msg string) {
 		logger.SetPrefix("ERROR:")
 		logger.Println(msg)
 	}
+
 	// Hop-by-hop headers. These are removed when sent to the backend.
 	// http://www.w3.org/Protocols/rfc2616/rfc2616-sec13.html
 	hopHeaders = []string{
@@ -72,27 +82,22 @@ func validate(config *BroadcastConfig) error {
 	if config.Options == nil {
 		return broadcastError("Broadcast options are missing")
 	}
-	if _, present := config.Options[PORT]; !present {
+	configureLogger(config.Options)
+	if config.Options.Port == 0 {
 		return broadcastError("Broadcast port is missing in broadcast options")
 	}
-	if _, present := config.Options[PRIMARY]; !present {
+	if config.Options.PrimaryEndpoint == "" {
 		return broadcastError("Primary endpoint is missing in broadcast options")
 	}
-	if _, present := config.Options[RESPONSE_TIMEOUT_IN_SECS]; !present {
+	if config.Options.ResponseTimeoutInSecs == 0 {
 		return broadcastError("Response timeout is missing in broadcast options")
-	}
-	if path, present := config.Options[BROADCAST_LOG]; present {
-		setLogDestination(path)
-	}
-	if _, err := strconv.Atoi(config.Options[RESPONSE_TIMEOUT_IN_SECS]); err != nil {
-		return broadcastError(err.Error())
 	}
 	if config.Backends == nil || len(config.Backends) == 0 {
 		return broadcastError("Backends are missing or empty")
 	} else {
 		config.backends = make(map[EndPointId]*url.URL)
 	}
-	if _, present := config.Backends[config.Options[PRIMARY]]; !present {
+	if _, present := config.Backends[config.Options.PrimaryEndpoint]; !present {
 		return broadcastError("Primary backend missing from the given set of backends")
 	}
 	for k, v := range config.Backends {
@@ -119,12 +124,15 @@ func cloneHeader(h http.Header) http.Header {
 	return h2
 }
 
-func setLogDestination(broadcastLogFile string) {
-	if logFile, err := os.OpenFile(broadcastLogFile, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644); err == nil {
-		infoLog(fmt.Sprintf("Logging to %s...", broadcastLogFile))
-		logger.SetOutput(logFile)
-	} else {
-		errorLog(err.Error())
+func configureLogger(options *BroadcastOptions) {
+	currentLogLevel = options.LogLevel
+	broadcastLogFile := options.LogFile
+	if broadcastLogFile != "" {
+		if logFile, err := os.OpenFile(broadcastLogFile, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644); err == nil {
+			logger.SetOutput(logFile)
+		} else {
+			errorLog(err.Error())
+		}
 	}
 }
 
@@ -229,8 +237,7 @@ func copyHeader(dst, src http.Header) {
 }
 
 func readResponseTimeout(config *BroadcastConfig) time.Duration {
-	n, _ := strconv.Atoi(config.Options[RESPONSE_TIMEOUT_IN_SECS])
-	return time.Duration(n) * time.Second
+	return time.Duration(config.Options.ResponseTimeoutInSecs) * time.Second
 }
 
 func copyResponse(rw http.ResponseWriter, res *http.Response) {
@@ -252,7 +259,7 @@ func (b *Broadcaster) handler(rw http.ResponseWriter, req *http.Request) {
 	res_chan := make(chan *http.Response)
 	err_chan := make(chan error)
 
-	primary_endpoint_id := b.config.Options[PRIMARY]
+	primary_endpoint_id := b.config.Options.PrimaryEndpoint
 	for id, endpoint := range b.config.backends {
 		request := newRequest(req, endpoint)
 		infoLog("Sending request: " + request.URL.String())
@@ -300,7 +307,6 @@ func NewBroadcaster(broadcastConfig *BroadcastConfig) (*Broadcaster, error) {
 	if err := validate(broadcastConfig); err != nil {
 		return nil, err
 	}
-
 	broadcaster := &Broadcaster{
 		reporter: &NoOpReporter{},
 		config:   broadcastConfig,
@@ -316,5 +322,5 @@ func (b *Broadcaster) WithMetricsReporter(reporter MetricsReporter) {
 }
 
 func (b *Broadcaster) ListenAndServe() error {
-	return http.ListenAndServe(fmt.Sprintf(":%s", b.config.Options[PORT]), b.Handler)
+	return http.ListenAndServe(fmt.Sprintf(":%s", b.config.Options.Port), b.Handler)
 }

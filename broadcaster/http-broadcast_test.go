@@ -20,7 +20,7 @@ func newListener(endpoint string) net.Listener {
 
 func newBroadcastServer(handler http.HandlerFunc) *httptest.Server {
 	aServer := httptest.NewUnstartedServer(handler)
-	aServer.Listener = newListener(fmt.Sprintf("localhost:%s", BroadcastServerPort))
+	aServer.Listener = newListener(fmt.Sprintf("localhost:%d", BroadcastServerPort))
 	aServer.Start()
 	return aServer
 }
@@ -38,7 +38,7 @@ func newServer(tag, endpoint string, res_chan chan<- string) *httptest.Server {
 
 const (
 	PrimaryTag          = "B2"
-	BroadcastServerPort = "9090"
+	BroadcastServerPort = 9090
 	NumRequests         = 10
 )
 
@@ -89,10 +89,11 @@ func startBroadcastServer() {
 	}
 	if broadcaster, err := NewBroadcaster(&BroadcastConfig{
 		Backends: servers,
-		Options: map[BroadcastOption]string{
-			PORT:                     BroadcastServerPort,
-			PRIMARY:                  PrimaryTag,
-			RESPONSE_TIMEOUT_IN_SECS: "10",
+		Options: &BroadcastOptions{
+			Port:                  BroadcastServerPort,
+			PrimaryEndpoint:       PrimaryTag,
+			ResponseTimeoutInSecs: 10,
+			LogLevel:              ERROR,
 		},
 	}); err != nil {
 		log.Fatal(err)
