@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func newListener(endpoint string) net.Listener {
@@ -22,17 +23,20 @@ func newBroadcastServer(handler http.HandlerFunc) *httptest.Server {
 	aServer := httptest.NewUnstartedServer(handler)
 	aServer.Listener = newListener(fmt.Sprintf("localhost:%d", BroadcastServerPort))
 	aServer.Start()
+	log.Println("Started broadcast server.")
 	return aServer
 }
 
-func newServer(tag, endpoint string, res_chan chan<- string) *httptest.Server {
+func newServer(tag, endpoint string) *httptest.Server {
 	aServer := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		response := fmt.Sprintf("%s Got Request", tag)
+		log.Println(response)
 		res_chan <- response
 		fmt.Fprint(w, response)
 	}))
 	aServer.Listener = newListener(endpoint)
 	aServer.Start()
+	log.Printf("Started server. Tag: %s, Endpoint: %s\n", tag, endpoint)
 	return aServer
 }
 
@@ -64,6 +68,7 @@ func httpGet(url string) string {
 }
 
 var broadcast_server *httptest.Server
+var res_chan chan string
 var (
 	backendServers = map[string]string{
 		"B1":       "localhost:9091",
@@ -71,13 +76,12 @@ var (
 		"B3":       "localhost:9093",
 	}
 	backends = make([]*httptest.Server, len(backendServers))
-	res_chan = make(chan string, len(backendServers))
 )
 
 func startBackendServers() {
 	i := 0
 	for t, e := range backendServers {
-		backends[i] = newServer(t, e, res_chan)
+		backends[i] = newServer(t, e)
 		i++
 	}
 }
@@ -87,13 +91,14 @@ func startBroadcastServer() {
 	for t, e := range backendServers {
 		servers[t] = fmt.Sprintf("http://%s", e)
 	}
+	log.Println("Starting broadcast server with the following backends...")
+	log.Println(servers)
 	if broadcaster, err := NewBroadcaster(&BroadcastConfig{
 		Backends: servers,
 		Options: &BroadcastOptions{
-			Port:                  BroadcastServerPort,
-			PrimaryEndpoint:       PrimaryTag,
-			ResponseTimeoutInSecs: 10,
-			LogLevel:              ERROR,
+			Port:            BroadcastServerPort,
+			PrimaryEndpoint: PrimaryTag,
+			LogLevel:        ERROR,
 		},
 	}); err != nil {
 		log.Fatal(err)
@@ -115,23 +120,23 @@ func teardown() {
 }
 
 func testSingleBroadcastRequest(tb testing.TB) {
-	responded := make(map[string]bool, len(backendServers))
+	res_chan = make(chan string, len(backendServers))
 	broadcast_res := httpGet("http://localhost:9090")
 	if primary_tag := readTag(broadcast_res); primary_tag != PrimaryTag {
 		tb.Errorf("Expected primary tag %s, Actual primary tag %s. Broadcast Response %s", PrimaryTag, primary_tag, broadcast_res)
 	}
-	for range backendServers {
+	ticker := time.NewTicker(1 * time.Second)
+	for i := 0; i < len(backendServers); {
 		select {
+		case <-ticker.C:
+			log.Println("Waiting for another second")
 		case msg := <-res_chan:
-			responded[readTag(msg)] = true
-		default:
+			i++
+			tag := readTag(msg)
+			log.Printf("Response from backend server. Tag: %s. Response: %s\n", tag, msg)
 		}
 	}
-	for k, v := range responded {
-		if !v {
-			tb.Errorf("No response from server with tag: %s", k)
-		}
-	}
+	ticker.Stop()
 }
 
 func BenchmarkHTTPBroadcast(b *testing.B) {
@@ -149,6 +154,7 @@ func TestHTTPBroadcast(t *testing.T) {
 	setup()
 	defer teardown()
 	for i := 1; i <= NumRequests; i++ {
+		log.Printf("Executing testcase #%d...\n", i)
 		testSingleBroadcastRequest(t)
 	}
 }

@@ -11,7 +11,6 @@ import (
 	"net/url"
 	"os"
 	"strings"
-	"time"
 )
 
 type (
@@ -22,17 +21,17 @@ type (
 )
 
 type BroadcastOptions struct {
-	Port                  int         `yaml:"Port"`
-	PrimaryEndpoint       string      `yaml:"PrimaryEndpoint"`
-	ResponseTimeoutInSecs int         `yaml:"ResponseTimeoutInSecs"`
-	LogFile               string      `yaml:"LogFile"`
-	LogLevel              LoggerLevel `yaml:"EnableInfoLogs"`
+	Port            int         `yaml:"Port"`
+	PrimaryEndpoint string      `yaml:"PrimaryEndpoint"`
+	LogFile         string      `yaml:"LogFile"`
+	LogLevel        LoggerLevel `yaml:"EnableInfoLogs"`
 }
 
 type BroadcastConfig struct {
-	Options  *BroadcastOptions `yaml:"Options,omitempty"`
-	Backends EndPoints         `yaml:"Backends,omitempty"`
-	backends map[EndPointId]*url.URL
+	Options           *BroadcastOptions `yaml:"Options,omitempty"`
+	Backends          EndPoints         `yaml:"Backends,omitempty"`
+	primaryBackend    *url.URL
+	secondaryBackends map[EndPointId]*url.URL
 }
 
 const (
@@ -71,6 +70,33 @@ var (
 	}
 )
 
+type TimingContext struct {
+	Context interface{}
+}
+
+type MetricsReporter interface {
+	Increment(tag string)
+	Gauge(tag string, value interface{})
+	Count(tag string, value interface{})
+	StartTiming() *TimingContext
+	EndTiming(tc *TimingContext, tag string)
+}
+
+type NoOpReporter struct{}
+
+func (r *NoOpReporter) StartTiming() *TimingContext             { return nil }
+func (r *NoOpReporter) Increment(tag string)                    {}
+func (r *NoOpReporter) Gauge(tag string, value interface{})     {}
+func (r *NoOpReporter) Count(tag string, value interface{})     {}
+func (r *NoOpReporter) Time(tag string)                         {}
+func (r *NoOpReporter) EndTiming(tc *TimingContext, tag string) {}
+
+type Broadcaster struct {
+	Handler  http.HandlerFunc
+	reporter MetricsReporter
+	config   *BroadcastConfig
+}
+
 func broadcastError(msg string) error {
 	return fmt.Errorf("[HTTP Broadcast] %s", msg)
 }
@@ -89,13 +115,10 @@ func validate(config *BroadcastConfig) error {
 	if config.Options.PrimaryEndpoint == "" {
 		return broadcastError("Primary endpoint is missing in broadcast options")
 	}
-	if config.Options.ResponseTimeoutInSecs == 0 {
-		return broadcastError("Response timeout is missing in broadcast options")
-	}
 	if config.Backends == nil || len(config.Backends) == 0 {
 		return broadcastError("Backends are missing or empty")
 	} else {
-		config.backends = make(map[EndPointId]*url.URL)
+		config.secondaryBackends = make(map[EndPointId]*url.URL)
 	}
 	if _, present := config.Backends[config.Options.PrimaryEndpoint]; !present {
 		return broadcastError("Primary backend missing from the given set of backends")
@@ -107,7 +130,11 @@ func validate(config *BroadcastConfig) error {
 			if backend_url, err := url.Parse(v); err != nil {
 				return broadcastError(fmt.Sprintf("Invalid url: %s for endpoint with ID: %s. Error: %s", v, k, err.Error()))
 			} else {
-				config.backends[k] = backend_url
+				if k == config.Options.PrimaryEndpoint {
+					config.primaryBackend = backend_url
+				} else {
+					config.secondaryBackends[k] = backend_url
+				}
 			}
 		}
 	}
@@ -192,37 +219,19 @@ func newRequest(req *http.Request, req_url *url.URL) *http.Request {
 	return new_req
 }
 
-func requestToPrimary(req *http.Request, id EndPointId, endpoint *url.URL, res_chan chan<- *http.Response, err_chan chan<- error, reporter MetricsReporter) {
+func requestToBackend(req *http.Request, id EndPointId, endpoint *url.URL, reporter MetricsReporter, metricPrefix string) (*http.Response, error) {
+	new_req := req.WithContext(context.Background())
 	tc := reporter.StartTiming()
-	defer reporter.EndTiming(tc, "primary.response_time")
+	defer reporter.EndTiming(tc, fmt.Sprintf("%s.response_time", metricPrefix))
 	transport := http.DefaultTransport
-	if res, err := transport.RoundTrip(req); err == nil {
-		infoLog(fmt.Sprintf("Received response with status %d", res.StatusCode))
-		reporter.Increment("primary.success.count")
-		res_chan <- res
+	if res, err := transport.RoundTrip(new_req); err == nil {
+		infoLog(fmt.Sprintf("Received response with status %d from [%s]:[%s]", res.StatusCode, id, endpoint))
+		reporter.Increment(fmt.Sprintf("%s.success.count", metricPrefix))
+		return res, nil
 	} else {
-		reporter.Increment("primary.failure.count")
+		reporter.Increment(fmt.Sprintf("%s.failure.count", metricPrefix))
 		errorLog(fmt.Sprintf("Error response from [%s]:[%s] -> %s", id, endpoint, err.Error()))
-		err_chan <- err
-	}
-}
-
-func requestToSecondary(req *http.Request, id EndPointId, endpoint *url.URL, reporter MetricsReporter) {
-	tc := reporter.StartTiming()
-	defer reporter.EndTiming(tc, "secondary.response_time")
-	transport := http.DefaultTransport
-	if res, err := transport.RoundTrip(req); err == nil {
-		infoLog(fmt.Sprintf("Received response with status %d", res.StatusCode))
-		reporter.Increment("secondary.success.count")
-		defer res.Body.Close()
-		var buf bytes.Buffer
-		writer := bufio.NewWriter(&buf)
-		io.Copy(writer, res.Body)
-		writer.Flush()
-		infoLog(buf.String())
-	} else {
-		reporter.Increment("secondary.failure.count")
-		errorLog(fmt.Sprintf("Error response from [%s]:[%s] -> %s", id, endpoint, err.Error()))
+		return nil, err
 	}
 }
 
@@ -232,10 +241,6 @@ func copyHeader(dst, src http.Header) {
 			dst.Add(k, v)
 		}
 	}
-}
-
-func readResponseTimeout(config *BroadcastConfig) time.Duration {
-	return time.Duration(config.Options.ResponseTimeoutInSecs) * time.Second
 }
 
 func copyResponse(rw http.ResponseWriter, res *http.Response) {
@@ -251,61 +256,39 @@ func copyResponse(rw http.ResponseWriter, res *http.Response) {
 	}
 }
 
+func logResponse(res *http.Response) {
+	defer res.Body.Close()
+	var buf bytes.Buffer
+	writer := bufio.NewWriter(&buf)
+	io.Copy(writer, res.Body)
+	writer.Flush()
+	infoLog(buf.String())
+}
+
 func (b *Broadcaster) handler(rw http.ResponseWriter, req *http.Request) {
 	b.reporter.Increment("broadcaster.request.count")
 	infoLog("Received request: " + req.URL.String())
-	res_chan := make(chan *http.Response)
-	err_chan := make(chan error)
 
 	primary_endpoint_id := b.config.Options.PrimaryEndpoint
-	for id, endpoint := range b.config.backends {
-		request := newRequest(req, endpoint)
-		infoLog("Sending request: " + request.URL.String())
-		switch id {
-		case primary_endpoint_id:
-			go requestToPrimary(request, id, endpoint, res_chan, err_chan, b.reporter)
-		default:
-			go requestToSecondary(request, id, endpoint, b.reporter)
-		}
-	}
-
-	response_timeout := readResponseTimeout(b.config)
-	select {
-	case res := <-res_chan:
+	primary_backend := b.config.primaryBackend
+	primary_request := newRequest(req, primary_backend)
+	infoLog(fmt.Sprintf("Sending request to primary endpoint [%s]: %s", primary_endpoint_id, primary_request.URL.String()))
+	if res, err := requestToBackend(primary_request, primary_endpoint_id, b.config.primaryBackend, b.reporter, "primary"); err == nil {
 		copyResponse(rw, res)
-	case err := <-err_chan:
+	} else {
+		rw.WriteHeader(http.StatusServiceUnavailable)
 		fmt.Fprintln(rw, string(err.Error()))
-	case <-time.After(response_timeout):
-		b.reporter.Increment("broadcaster.timeout.count")
-		fmt.Fprintln(rw, "Timeout") //TODO Handle this correctly
 	}
-}
 
-type TimingContext struct {
-	Context interface{}
-}
-
-type MetricsReporter interface {
-	Increment(tag string)
-	Gauge(tag string, value interface{})
-	Count(tag string, value interface{})
-	StartTiming() *TimingContext
-	EndTiming(tc *TimingContext, tag string)
-}
-
-type NoOpReporter struct{}
-
-func (r *NoOpReporter) StartTiming() *TimingContext             { return nil }
-func (r *NoOpReporter) Increment(tag string)                    {}
-func (r *NoOpReporter) Gauge(tag string, value interface{})     {}
-func (r *NoOpReporter) Count(tag string, value interface{})     {}
-func (r *NoOpReporter) Time(tag string)                         {}
-func (r *NoOpReporter) EndTiming(tc *TimingContext, tag string) {}
-
-type Broadcaster struct {
-	Handler  http.HandlerFunc
-	reporter MetricsReporter
-	config   *BroadcastConfig
+	for id, secondary_backend := range b.config.secondaryBackends {
+		secondary_request := newRequest(req, secondary_backend)
+		infoLog(fmt.Sprintf("Sending request to secondary endpoint [%s]: %s", id, secondary_request.URL.String()))
+		go func() {
+			if res, _ := requestToBackend(secondary_request, id, secondary_backend, b.reporter, "secondary"); res != nil {
+				logResponse(res)
+			}
+		}()
+	}
 }
 
 func NewBroadcaster(broadcastConfig *BroadcastConfig) (*Broadcaster, error) {
