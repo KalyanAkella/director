@@ -220,17 +220,16 @@ func newRequest(req *http.Request, req_url *url.URL) *http.Request {
 }
 
 func requestToBackend(req *http.Request, id EndPointId, endpoint *url.URL, reporter MetricsReporter, metricPrefix string) (*http.Response, error) {
-	new_req := req.WithContext(context.Background())
 	tc := reporter.StartTiming()
 	defer reporter.EndTiming(tc, fmt.Sprintf("%s.response_time", metricPrefix))
 	transport := http.DefaultTransport
-	if res, err := transport.RoundTrip(new_req); err == nil {
-		infoLog(fmt.Sprintf("Received response with status %d from [%s]:[%s]", res.StatusCode, id, endpoint))
-		reporter.Increment(fmt.Sprintf("%s.success.count", metricPrefix))
+	if res, err := transport.RoundTrip(req); err == nil {
+		go infoLog(fmt.Sprintf("Received response with status %d from [%s]:[%s]", res.StatusCode, id, endpoint))
+		go reporter.Increment(fmt.Sprintf("%s.success.count", metricPrefix))
 		return res, nil
 	} else {
-		reporter.Increment(fmt.Sprintf("%s.failure.count", metricPrefix))
-		errorLog(fmt.Sprintf("Error response from [%s]:[%s] -> %s", id, endpoint, err.Error()))
+		go reporter.Increment(fmt.Sprintf("%s.failure.count", metricPrefix))
+		go errorLog(fmt.Sprintf("Error response from [%s]:[%s] -> %s", id, endpoint, err.Error()))
 		return nil, err
 	}
 }
@@ -266,29 +265,31 @@ func logResponse(res *http.Response) {
 }
 
 func (b *Broadcaster) handler(rw http.ResponseWriter, req *http.Request) {
-	b.reporter.Increment("broadcaster.request.count")
-	infoLog("Received request: " + req.URL.String())
+	go b.reporter.Increment("broadcaster.request.count")
+	go infoLog("Received request: " + req.URL.String())
 
 	primary_endpoint_id := b.config.Options.PrimaryEndpoint
 	primary_backend := b.config.primaryBackend
-	primary_request := newRequest(req, primary_backend)
-	infoLog(fmt.Sprintf("Sending request to primary endpoint [%s]: %s", primary_endpoint_id, primary_request.URL.String()))
-	if res, err := requestToBackend(primary_request, primary_endpoint_id, b.config.primaryBackend, b.reporter, "primary"); err == nil {
+	modifyRequestForBroadcast(req, primary_backend)
+	go infoLog(fmt.Sprintf("Sending request to primary endpoint [%s]: %s", primary_endpoint_id, req.URL.String()))
+	if res, err := requestToBackend(req, primary_endpoint_id, b.config.primaryBackend, b.reporter, "primary"); err == nil {
 		copyResponse(rw, res)
 	} else {
 		rw.WriteHeader(http.StatusServiceUnavailable)
 		fmt.Fprintln(rw, string(err.Error()))
 	}
 
-	for id, secondary_backend := range b.config.secondaryBackends {
-		secondary_request := newRequest(req, secondary_backend)
-		infoLog(fmt.Sprintf("Sending request to secondary endpoint [%s]: %s", id, secondary_request.URL.String()))
-		go func() {
-			if res, _ := requestToBackend(secondary_request, id, secondary_backend, b.reporter, "secondary"); res != nil {
-				logResponse(res)
-			}
-		}()
-	}
+	go func() {
+		for id, secondary_backend := range b.config.secondaryBackends {
+			secondary_request := newRequest(req, secondary_backend)
+			infoLog(fmt.Sprintf("Sending request to secondary endpoint [%s]: %s", id, secondary_request.URL.String()))
+			go func() {
+				if res, _ := requestToBackend(secondary_request, id, secondary_backend, b.reporter, "secondary"); res != nil {
+					logResponse(res)
+				}
+			}()
+		}
+	}()
 }
 
 func NewBroadcaster(broadcastConfig *BroadcastConfig) (*Broadcaster, error) {
