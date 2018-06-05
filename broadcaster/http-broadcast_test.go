@@ -23,20 +23,17 @@ func newBroadcastServer(handler http.HandlerFunc) *httptest.Server {
 	aServer := httptest.NewUnstartedServer(handler)
 	aServer.Listener = newListener(fmt.Sprintf("localhost:%d", BroadcastServerPort))
 	aServer.Start()
-	log.Println("Started broadcast server.")
 	return aServer
 }
 
 func newServer(tag, endpoint string) *httptest.Server {
 	aServer := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		response := fmt.Sprintf("%s Got Request", tag)
-		log.Println(response)
 		res_chan <- response
 		fmt.Fprint(w, response)
 	}))
 	aServer.Listener = newListener(endpoint)
 	aServer.Start()
-	log.Printf("Started server. Tag: %s, Endpoint: %s\n", tag, endpoint)
 	return aServer
 }
 
@@ -91,8 +88,6 @@ func startBroadcastServer() {
 	for t, e := range backendServers {
 		servers[t] = fmt.Sprintf("http://%s", e)
 	}
-	log.Println("Starting broadcast server with the following backends...")
-	log.Println(servers)
 	if broadcaster, err := NewBroadcaster(&BroadcastConfig{
 		Backends: servers,
 		Options: &BroadcastOptions{
@@ -119,42 +114,45 @@ func teardown() {
 	}
 }
 
-func testSingleBroadcastRequest(tb testing.TB) {
-	res_chan = make(chan string, len(backendServers))
-	broadcast_res := httpGet("http://localhost:9090")
-	if primary_tag := readTag(broadcast_res); primary_tag != PrimaryTag {
-		tb.Errorf("Expected primary tag %s, Actual primary tag %s. Broadcast Response %s", PrimaryTag, primary_tag, broadcast_res)
+func TestHTTPBroadcast(t *testing.T) {
+	setup()
+	defer teardown()
+	for i := 1; i <= NumRequests; i++ {
+		res_chan = make(chan string, len(backendServers))
+		broadcast_res := httpGet("http://localhost:9090")
+		assertForPrimaryResponse(t, broadcast_res)
+		waitForSecondaryResponses(res_chan)
 	}
-	ticker := time.NewTicker(1 * time.Second)
-	for i := 0; i < len(backendServers); {
-		select {
-		case <-ticker.C:
-			log.Println("Waiting for another second")
-		case msg := <-res_chan:
-			i++
-			tag := readTag(msg)
-			log.Printf("Response from backend server. Tag: %s. Response: %s\n", tag, msg)
-		}
-	}
-	ticker.Stop()
 }
 
 func BenchmarkHTTPBroadcast(b *testing.B) {
 	setup()
 	defer teardown()
 	b.ResetTimer()
-	b.RunParallel(func(pb *testing.PB) {
-		for pb.Next() {
-			testSingleBroadcastRequest(b)
-		}
-	})
+	for i := 1; i <= b.N; i++ {
+		res_chan = make(chan string, len(backendServers))
+		broadcast_res := httpGet("http://localhost:9090")
+		assertForPrimaryResponse(b, broadcast_res)
+		waitForSecondaryResponses(res_chan)
+	}
 }
 
-func TestHTTPBroadcast(t *testing.T) {
-	setup()
-	defer teardown()
-	for i := 1; i <= NumRequests; i++ {
-		log.Printf("Executing testcase #%d...\n", i)
-		testSingleBroadcastRequest(t)
+func assertForPrimaryResponse(tb testing.TB, response_str string) {
+	if primary_tag := readTag(response_str); primary_tag != PrimaryTag {
+		tb.Errorf("Expected primary tag %s, Actual primary tag %s. Broadcast Response %s", PrimaryTag, primary_tag, response_str)
+	}
+}
+
+func waitForSecondaryResponses(res_chan <-chan string) {
+	timer := time.NewTimer(1 * time.Second)
+	defer timer.Stop()
+	for i := 1; i <= len(backendServers); {
+		select {
+		case <-timer.C:
+			timer.Reset(time.Duration(i) * time.Second)
+		case <-res_chan:
+			i++
+			// log.Printf("Response from backend server. Tag: %s. Response: %s\n", readTag(msg), msg)
+		}
 	}
 }
