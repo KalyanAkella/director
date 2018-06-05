@@ -13,7 +13,8 @@ import (
 
 func newListener(endpoint string) net.Listener {
 	if l, err := net.Listen("tcp", endpoint); err != nil {
-		panic(err)
+		log.Fatal(err)
+		return nil
 	} else {
 		return l
 	}
@@ -46,18 +47,20 @@ const (
 func readTag(response string) string {
 	var tag string
 	if _, err := fmt.Sscanf(response, "%s", &tag); err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
 	return tag
 }
 
 func httpGet(url string) (string, int) {
 	if res, err := http.Get(url); err != nil {
-		panic(err)
+		log.Fatal(err)
+		return "", -1
 	} else {
 		defer res.Body.Close()
 		if res_bytes, err := ioutil.ReadAll(res.Body); err != nil {
-			panic(err)
+			log.Fatal(err)
+			return "", -1
 		} else {
 			return string(res_bytes), res.StatusCode
 		}
@@ -66,20 +69,13 @@ func httpGet(url string) (string, int) {
 
 var broadcast_server *httptest.Server
 var res_chan chan string
-var (
-	backendServers = map[string]string{
-		"B1":       "localhost:9091",
-		PrimaryTag: "localhost:9092",
-		"B3":       "localhost:9093",
-	}
-	backends = make([]*httptest.Server, len(backendServers))
-)
+var backends map[string]*httptest.Server
+var backendServers map[string]string
 
 func startBackendServers() {
-	i := 0
+	backends = make(map[string]*httptest.Server)
 	for t, e := range backendServers {
-		backends[i] = newServer(t, e)
-		i++
+		backends[t] = newServer(t, e)
 	}
 }
 
@@ -108,13 +104,33 @@ func setup() {
 }
 
 func teardown() {
-	broadcast_server.Close()
+	shutdownBackend(broadcast_server)
 	for _, backend := range backends {
-		backend.Close()
+		shutdownBackend(backend)
 	}
 }
 
-func TestHTTPBroadcast(t *testing.T) {
+func shutdownBackend(backend *httptest.Server) {
+	backend.CloseClientConnections()
+	backend.Close()
+}
+
+func TestHTTPBroadcastWithFailureResponse(t *testing.T) {
+	backendServers = make(map[string]string)
+	backendServers["B1"] = "localhost:9094"
+	backendServers[PrimaryTag] = "localhost:9095"
+	setup()
+	defer teardown()
+	shutdownBackend(backends[PrimaryTag])
+	_, status_code := httpGet("http://localhost:9090")
+	assertStatusCode(t, status_code, http.StatusServiceUnavailable)
+}
+
+func TestHTTPBroadcastWithSuccessResponse(t *testing.T) {
+	backendServers = make(map[string]string)
+	backendServers["B1"] = "localhost:9091"
+	backendServers[PrimaryTag] = "localhost:9092"
+	backendServers["B3"] = "localhost:9093"
 	setup()
 	defer teardown()
 	for i := 1; i <= NumRequests; i++ {
@@ -127,6 +143,10 @@ func TestHTTPBroadcast(t *testing.T) {
 }
 
 func BenchmarkHTTPBroadcast(b *testing.B) {
+	backendServers = make(map[string]string)
+	backendServers["B1"] = "localhost:9096"
+	backendServers[PrimaryTag] = "localhost:9097"
+	backendServers["B3"] = "localhost:9098"
 	setup()
 	defer teardown()
 	b.ResetTimer()
