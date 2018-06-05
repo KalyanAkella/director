@@ -7,9 +7,59 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 )
+
+/*
+
+type TimingContext struct {
+	Context interface{}
+}
+
+type MetricsReporter interface {
+	Increment(tag string)
+	Gauge(tag string, value interface{})
+	Count(tag string, value interface{})
+	StartTiming() *TimingContext
+	EndTiming(tc *TimingContext, tag string)
+}
+
+*/
+
+type Reporter struct {
+	metrics map[string]uint64
+	m       sync.Mutex
+}
+
+func (r *Reporter) Increment(tag string) {
+	r.m.Lock()
+	defer r.m.Unlock()
+	r.metrics[tag]++
+}
+
+func (r *Reporter) Gauge(tag string, value interface{}) {
+	r.m.Lock()
+	defer r.m.Unlock()
+	r.metrics[tag] = value.(uint64)
+}
+
+func (r *Reporter) Count(tag string, value interface{}) {
+	r.m.Lock()
+	defer r.m.Unlock()
+	r.metrics[tag] += value.(uint64)
+}
+
+func (r *Reporter) StartTiming() *TimingContext { return nil }
+
+func (r *Reporter) EndTiming(tc *TimingContext, tag string) {}
+
+func (r *Reporter) Reset() {
+	r.m.Lock()
+	defer r.m.Unlock()
+	r.metrics = make(map[string]uint64)
+}
 
 func newListener(endpoint string) net.Listener {
 	if l, err := net.Listen("tcp", endpoint); err != nil {
@@ -71,6 +121,7 @@ var broadcast_server *httptest.Server
 var res_chan chan string
 var backends map[string]*httptest.Server
 var backendServers map[string]string
+var reporter *Reporter
 
 func startBackendServers() {
 	backends = make(map[string]*httptest.Server)
@@ -94,6 +145,8 @@ func startBroadcastServer() {
 	}); err != nil {
 		log.Fatal(err)
 	} else {
+		reporter = &Reporter{metrics: make(map[string]uint64)}
+		broadcaster.WithMetricsReporter(reporter)
 		broadcast_server = newBroadcastServer(broadcaster.Handler)
 	}
 }
@@ -115,6 +168,12 @@ func shutdownBackend(backend *httptest.Server) {
 	backend.Close()
 }
 
+func assertMetric(tb testing.TB, expected_value int, metric_name string) {
+	if reporter.metrics[metric_name] != uint64(expected_value) {
+		tb.Errorf("Metric name: %s. Expected: %d, Actual: %d", metric_name, expected_value, reporter.metrics[metric_name])
+	}
+}
+
 func TestHTTPBroadcastWithFailureResponse(t *testing.T) {
 	backendServers = make(map[string]string)
 	backendServers["B1"] = "localhost:9094"
@@ -124,6 +183,8 @@ func TestHTTPBroadcastWithFailureResponse(t *testing.T) {
 	shutdownBackend(backends[PrimaryTag])
 	_, status_code := httpGet("http://localhost:9090")
 	assertStatusCode(t, status_code, http.StatusServiceUnavailable)
+	assertMetric(t, 1, "primary.failure.count")
+	assertMetric(t, 1, "broadcaster.request.count")
 }
 
 func TestHTTPBroadcastWithSuccessResponse(t *testing.T) {
@@ -140,6 +201,8 @@ func TestHTTPBroadcastWithSuccessResponse(t *testing.T) {
 		assertForPrimaryResponse(t, broadcast_res)
 		waitForSecondaryResponses(res_chan)
 	}
+	assertMetric(t, NumRequests, "primary.success.count")
+	assertMetric(t, NumRequests, "broadcaster.request.count")
 }
 
 func BenchmarkHTTPBroadcast(b *testing.B) {
@@ -157,6 +220,8 @@ func BenchmarkHTTPBroadcast(b *testing.B) {
 		assertForPrimaryResponse(b, broadcast_res)
 		waitForSecondaryResponses(res_chan)
 	}
+	assertMetric(b, b.N, "primary.success.count")
+	assertMetric(b, b.N, "broadcaster.request.count")
 }
 
 func assertStatusCode(tb testing.TB, expected_status_code, actual_status_code int) {
