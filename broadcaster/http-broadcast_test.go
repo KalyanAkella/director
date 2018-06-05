@@ -51,7 +51,7 @@ func readTag(response string) string {
 	return tag
 }
 
-func httpGet(url string) string {
+func httpGet(url string) (string, int) {
 	if res, err := http.Get(url); err != nil {
 		panic(err)
 	} else {
@@ -59,7 +59,7 @@ func httpGet(url string) string {
 		if res_bytes, err := ioutil.ReadAll(res.Body); err != nil {
 			panic(err)
 		} else {
-			return string(res_bytes)
+			return string(res_bytes), res.StatusCode
 		}
 	}
 }
@@ -119,7 +119,8 @@ func TestHTTPBroadcast(t *testing.T) {
 	defer teardown()
 	for i := 1; i <= NumRequests; i++ {
 		res_chan = make(chan string, len(backendServers))
-		broadcast_res := httpGet("http://localhost:9090")
+		broadcast_res, status_code := httpGet("http://localhost:9090")
+		assertStatusCode(t, status_code, http.StatusOK)
 		assertForPrimaryResponse(t, broadcast_res)
 		waitForSecondaryResponses(res_chan)
 	}
@@ -131,9 +132,16 @@ func BenchmarkHTTPBroadcast(b *testing.B) {
 	b.ResetTimer()
 	for i := 1; i <= b.N; i++ {
 		res_chan = make(chan string, len(backendServers))
-		broadcast_res := httpGet("http://localhost:9090")
+		broadcast_res, status_code := httpGet("http://localhost:9090")
+		assertStatusCode(b, status_code, http.StatusOK)
 		assertForPrimaryResponse(b, broadcast_res)
 		waitForSecondaryResponses(res_chan)
+	}
+}
+
+func assertStatusCode(tb testing.TB, expected_status_code, actual_status_code int) {
+	if actual_status_code != expected_status_code {
+		tb.Errorf("Expected status code: %d. Actual status code: %d", expected_status_code, actual_status_code)
 	}
 }
 
