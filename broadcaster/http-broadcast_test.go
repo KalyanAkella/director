@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"sync"
 	"testing"
 	"time"
@@ -77,12 +78,38 @@ func newBroadcastServer(handler http.HandlerFunc) *httptest.Server {
 	return aServer
 }
 
-func newServer(tag, endpoint string) *httptest.Server {
-	aServer := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+func getHandler(tag string) http.HandlerFunc {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			log.Fatal(err)
+		}
 		response := fmt.Sprintf("%s Got Request", tag)
 		res_chan <- response
 		fmt.Fprint(w, response)
-	}))
+	})
+}
+
+func postHandler(tag string) http.HandlerFunc {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			log.Fatal(err)
+		}
+		log.Println(r.Form)
+		response := fmt.Sprintf("%s Got Request", tag)
+		res_chan <- response
+		fmt.Fprint(w, response)
+	})
+}
+
+func newPostServer(tag, endpoint string) *httptest.Server {
+	aServer := httptest.NewUnstartedServer(postHandler(tag))
+	aServer.Listener = newListener(endpoint)
+	aServer.Start()
+	return aServer
+}
+
+func newGetServer(tag, endpoint string) *httptest.Server {
+	aServer := httptest.NewUnstartedServer(getHandler(tag))
 	aServer.Listener = newListener(endpoint)
 	aServer.Start()
 	return aServer
@@ -100,6 +127,25 @@ func readTag(response string) string {
 		log.Fatal(err)
 	}
 	return tag
+}
+
+func httpPost(httpUrl string, data map[string]string) (string, int) {
+	values := url.Values{}
+	for k, v := range data {
+		values.Set(k, v)
+	}
+	if res, err := http.PostForm(httpUrl, values); err != nil {
+		log.Fatal(err)
+		return "", -1
+	} else {
+		defer res.Body.Close()
+		if res_bytes, err := ioutil.ReadAll(res.Body); err != nil {
+			log.Fatal(err)
+			return "", -1
+		} else {
+			return string(res_bytes), res.StatusCode
+		}
+	}
 }
 
 func httpGet(url string) (string, int) {
@@ -123,10 +169,17 @@ var backends map[string]*httptest.Server
 var backendServers map[string]string
 var reporter *Reporter
 
-func startBackendServers() {
+func startPostBackendServers() {
 	backends = make(map[string]*httptest.Server)
 	for t, e := range backendServers {
-		backends[t] = newServer(t, e)
+		backends[t] = newPostServer(t, e)
+	}
+}
+
+func startGetBackendServers() {
+	backends = make(map[string]*httptest.Server)
+	for t, e := range backendServers {
+		backends[t] = newGetServer(t, e)
 	}
 }
 
@@ -151,8 +204,13 @@ func startBroadcastServer() {
 	}
 }
 
-func setup() {
-	startBackendServers()
+func setupForGet() {
+	startGetBackendServers()
+	startBroadcastServer()
+}
+
+func setupForPost() {
+	startPostBackendServers()
 	startBroadcastServer()
 }
 
@@ -174,11 +232,11 @@ func assertMetric(tb testing.TB, expected_value int, metric_name string) {
 	}
 }
 
-func TestHTTPBroadcastWithFailureResponse(t *testing.T) {
+func TestHTTPGetBroadcastWithFailureResponse(t *testing.T) {
 	backendServers = make(map[string]string)
 	backendServers["B1"] = "localhost:9094"
 	backendServers[PrimaryTag] = "localhost:9095"
-	setup()
+	setupForGet()
 	defer teardown()
 	shutdownBackend(backends[PrimaryTag])
 	_, status_code := httpGet("http://localhost:9090")
@@ -187,12 +245,30 @@ func TestHTTPBroadcastWithFailureResponse(t *testing.T) {
 	assertMetric(t, 1, "broadcaster.request.count")
 }
 
-func TestHTTPBroadcastWithSuccessResponse(t *testing.T) {
+func TestHTTPPostBroadcastWithSuccessResponse(t *testing.T) {
+	backendServers = make(map[string]string)
+	backendServers["B1"] = "localhost:8091"
+	backendServers[PrimaryTag] = "localhost:8092"
+	backendServers["B3"] = "localhost:8093"
+	setupForPost()
+	defer teardown()
+	for i := 1; i <= NumRequests; i++ {
+		res_chan = make(chan string, len(backendServers))
+		broadcast_res, status_code := httpPost("http://localhost:9090", map[string]string{"K1": "V1"})
+		assertStatusCode(t, status_code, http.StatusOK)
+		assertForPrimaryResponse(t, broadcast_res)
+		waitForSecondaryResponses(res_chan)
+	}
+	assertMetric(t, NumRequests, "primary.success.count")
+	assertMetric(t, NumRequests, "broadcaster.request.count")
+}
+
+func TestHTTPGetBroadcastWithSuccessResponse(t *testing.T) {
 	backendServers = make(map[string]string)
 	backendServers["B1"] = "localhost:9091"
 	backendServers[PrimaryTag] = "localhost:9092"
 	backendServers["B3"] = "localhost:9093"
-	setup()
+	setupForGet()
 	defer teardown()
 	for i := 1; i <= NumRequests; i++ {
 		res_chan = make(chan string, len(backendServers))
@@ -205,12 +281,12 @@ func TestHTTPBroadcastWithSuccessResponse(t *testing.T) {
 	assertMetric(t, NumRequests, "broadcaster.request.count")
 }
 
-func BenchmarkHTTPBroadcast(b *testing.B) {
+func BenchmarkHTTPGetBroadcast(b *testing.B) {
 	backendServers = make(map[string]string)
 	backendServers["B1"] = "localhost:9096"
 	backendServers[PrimaryTag] = "localhost:9097"
 	backendServers["B3"] = "localhost:9098"
-	setup()
+	setupForGet()
 	defer teardown()
 	b.ResetTimer()
 	for i := 1; i <= b.N; i++ {

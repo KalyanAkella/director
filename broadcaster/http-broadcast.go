@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"net/url"
@@ -192,12 +193,11 @@ func modifyRequestForBroadcast(out_req *http.Request, target *url.URL) {
 	out_req.Host = ""
 }
 
-func newRequest(req *http.Request, req_url *url.URL) *http.Request {
+func newRequest(req *http.Request, req_body []byte, req_url *url.URL) *http.Request {
 	new_req := req.WithContext(context.Background())
 
-	if req.ContentLength == 0 {
-		new_req.Body = nil
-	}
+	new_req.ContentLength = int64(len(req_body))
+	new_req.Body = ioutil.NopCloser(bytes.NewReader(req_body))
 	new_req.Header = cloneHeader(req.Header)
 	modifyRequestForBroadcast(new_req, req_url)
 	new_req.Close = false
@@ -264,15 +264,25 @@ func logResponse(res *http.Response) {
 	infoLog(buf.String())
 }
 
+func readRequestBody(req *http.Request) []byte {
+	if buff, err := ioutil.ReadAll(req.Body); err != nil {
+		errorLog(fmt.Sprintf("An error occurred while reading request body. Error: %s", err.Error()))
+		return nil
+	} else {
+		return buff
+	}
+}
+
 func (b *Broadcaster) handler(rw http.ResponseWriter, req *http.Request) {
 	go b.reporter.Increment("broadcaster.request.count")
 	go infoLog("Received request: " + req.URL.String())
 
 	primary_endpoint_id := b.config.Options.PrimaryEndpoint
 	primary_backend := b.config.primaryBackend
-	modifyRequestForBroadcast(req, primary_backend)
-	go infoLog(fmt.Sprintf("Sending request to primary endpoint [%s]: %s", primary_endpoint_id, req.URL.String()))
-	if res, err := requestToBackend(req, primary_endpoint_id, b.config.primaryBackend, b.reporter, "primary"); err == nil {
+	body := readRequestBody(req)
+	primary_request := newRequest(req, body, primary_backend)
+	go infoLog(fmt.Sprintf("Sending request to primary endpoint [%s]: %s", primary_endpoint_id, primary_request.URL.String()))
+	if res, err := requestToBackend(primary_request, primary_endpoint_id, b.config.primaryBackend, b.reporter, "primary"); err == nil {
 		copyResponse(rw, res)
 	} else {
 		rw.WriteHeader(http.StatusServiceUnavailable)
@@ -281,7 +291,7 @@ func (b *Broadcaster) handler(rw http.ResponseWriter, req *http.Request) {
 
 	go func() {
 		for id, secondary_backend := range b.config.secondaryBackends {
-			secondary_request := newRequest(req, secondary_backend)
+			secondary_request := newRequest(req, body, secondary_backend)
 			infoLog(fmt.Sprintf("Sending request to secondary endpoint [%s]: %s", id, secondary_request.URL.String()))
 			go func() {
 				if res, _ := requestToBackend(secondary_request, id, secondary_backend, b.reporter, "secondary"); res != nil {
