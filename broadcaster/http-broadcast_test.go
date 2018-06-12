@@ -8,26 +8,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
 )
-
-/*
-
-type TimingContext struct {
-	Context interface{}
-}
-
-type MetricsReporter interface {
-	Increment(tag string)
-	Gauge(tag string, value interface{})
-	Count(tag string, value interface{})
-	StartTiming() *TimingContext
-	EndTiming(tc *TimingContext, tag string)
-}
-
-*/
 
 type Reporter struct {
 	metrics map[string]uint64
@@ -83,7 +68,7 @@ func getHandler(tag string) http.HandlerFunc {
 		if err := r.ParseForm(); err != nil {
 			log.Fatal(err)
 		}
-		response := fmt.Sprintf("%s Got Request", tag)
+		response := fmt.Sprintf("%s %v", tag, asMap(r.Form))
 		res_chan <- response
 		fmt.Fprint(w, response)
 	})
@@ -94,22 +79,25 @@ func postHandler(tag string) http.HandlerFunc {
 		if err := r.ParseForm(); err != nil {
 			log.Fatal(err)
 		}
-		log.Println(r.Form)
-		response := fmt.Sprintf("%s Got Request", tag)
+		response := fmt.Sprintf("%s %v", tag, asMap(r.Form))
 		res_chan <- response
 		fmt.Fprint(w, response)
 	})
 }
 
-func newPostServer(tag, endpoint string) *httptest.Server {
-	aServer := httptest.NewUnstartedServer(postHandler(tag))
-	aServer.Listener = newListener(endpoint)
-	aServer.Start()
-	return aServer
+func handler(tag string) http.HandlerFunc {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			log.Fatal(err)
+		}
+		response := fmt.Sprintf("%s %v", tag, asMap(r.Form))
+		res_chan <- response
+		fmt.Fprint(w, response)
+	})
 }
 
-func newGetServer(tag, endpoint string) *httptest.Server {
-	aServer := httptest.NewUnstartedServer(getHandler(tag))
+func newServer(tag, endpoint string) *httptest.Server {
+	aServer := httptest.NewUnstartedServer(handler(tag))
 	aServer.Listener = newListener(endpoint)
 	aServer.Start()
 	return aServer
@@ -121,20 +109,36 @@ const (
 	NumRequests         = 10
 )
 
-func readTag(response string) string {
-	var tag string
-	if _, err := fmt.Sscanf(response, "%s", &tag); err != nil {
+func parseResponse(response string) (string, string) {
+	var tag, message string
+	if _, err := fmt.Sscanf(response, "%s %s", &tag, &message); err != nil {
 		log.Fatal(err)
 	}
-	return tag
+	return tag, message
 }
 
-func httpPost(httpUrl string, data map[string]string) (string, int) {
+func asValues(data map[string]string) url.Values {
 	values := url.Values{}
 	for k, v := range data {
 		values.Set(k, v)
 	}
-	if res, err := http.PostForm(httpUrl, values); err != nil {
+	return values
+}
+
+func asMap(values url.Values) map[string]string {
+	result := make(map[string]string)
+	for k, vs := range values {
+		if len(vs) == 0 {
+			result[k] = ""
+		} else {
+			result[k] = vs[0]
+		}
+	}
+	return result
+}
+
+func httpPost(httpUrl string, data map[string]string) (string, int) {
+	if res, err := http.PostForm(httpUrl, asValues(data)); err != nil {
 		log.Fatal(err)
 		return "", -1
 	} else {
@@ -148,8 +152,8 @@ func httpPost(httpUrl string, data map[string]string) (string, int) {
 	}
 }
 
-func httpGet(url string) (string, int) {
-	if res, err := http.Get(url); err != nil {
+func httpGet(httpUrl string, data map[string]string) (string, int) {
+	if res, err := http.Get(fmt.Sprintf("%s?%s", httpUrl, asValues(data).Encode())); err != nil {
 		log.Fatal(err)
 		return "", -1
 	} else {
@@ -169,17 +173,10 @@ var backends map[string]*httptest.Server
 var backendServers map[string]string
 var reporter *Reporter
 
-func startPostBackendServers() {
+func startBackendServers() {
 	backends = make(map[string]*httptest.Server)
 	for t, e := range backendServers {
-		backends[t] = newPostServer(t, e)
-	}
-}
-
-func startGetBackendServers() {
-	backends = make(map[string]*httptest.Server)
-	for t, e := range backendServers {
-		backends[t] = newGetServer(t, e)
+		backends[t] = newServer(t, e)
 	}
 }
 
@@ -204,13 +201,8 @@ func startBroadcastServer() {
 	}
 }
 
-func setupForGet() {
-	startGetBackendServers()
-	startBroadcastServer()
-}
-
-func setupForPost() {
-	startPostBackendServers()
+func setup() {
+	startBackendServers()
 	startBroadcastServer()
 }
 
@@ -236,10 +228,10 @@ func TestHTTPGetBroadcastWithFailureResponse(t *testing.T) {
 	backendServers = make(map[string]string)
 	backendServers["B1"] = "localhost:9094"
 	backendServers[PrimaryTag] = "localhost:9095"
-	setupForGet()
+	setup()
 	defer teardown()
 	shutdownBackend(backends[PrimaryTag])
-	_, status_code := httpGet("http://localhost:9090")
+	_, status_code := httpGet("http://localhost:9090", map[string]string{})
 	assertStatusCode(t, status_code, http.StatusServiceUnavailable)
 	assertMetric(t, 1, "primary.failure.count")
 	assertMetric(t, 1, "broadcaster.request.count")
@@ -250,13 +242,14 @@ func TestHTTPPostBroadcastWithSuccessResponse(t *testing.T) {
 	backendServers["B1"] = "localhost:8091"
 	backendServers[PrimaryTag] = "localhost:8092"
 	backendServers["B3"] = "localhost:8093"
-	setupForPost()
+	setup()
 	defer teardown()
 	for i := 1; i <= NumRequests; i++ {
 		res_chan = make(chan string, len(backendServers))
-		broadcast_res, status_code := httpPost("http://localhost:9090", map[string]string{"K1": "V1"})
+		data := map[string]string{"index": strconv.Itoa(i)}
+		broadcast_res, status_code := httpPost("http://localhost:9090", data)
 		assertStatusCode(t, status_code, http.StatusOK)
-		assertForPrimaryResponse(t, broadcast_res)
+		assertForPrimaryResponse(t, broadcast_res, data)
 		waitForSecondaryResponses(res_chan)
 	}
 	assertMetric(t, NumRequests, "primary.success.count")
@@ -268,13 +261,14 @@ func TestHTTPGetBroadcastWithSuccessResponse(t *testing.T) {
 	backendServers["B1"] = "localhost:9091"
 	backendServers[PrimaryTag] = "localhost:9092"
 	backendServers["B3"] = "localhost:9093"
-	setupForGet()
+	setup()
 	defer teardown()
 	for i := 1; i <= NumRequests; i++ {
 		res_chan = make(chan string, len(backendServers))
-		broadcast_res, status_code := httpGet("http://localhost:9090")
+		data := map[string]string{"index": strconv.Itoa(i)}
+		broadcast_res, status_code := httpGet("http://localhost:9090", data)
 		assertStatusCode(t, status_code, http.StatusOK)
-		assertForPrimaryResponse(t, broadcast_res)
+		assertForPrimaryResponse(t, broadcast_res, data)
 		waitForSecondaryResponses(res_chan)
 	}
 	assertMetric(t, NumRequests, "primary.success.count")
@@ -286,14 +280,15 @@ func BenchmarkHTTPGetBroadcast(b *testing.B) {
 	backendServers["B1"] = "localhost:9096"
 	backendServers[PrimaryTag] = "localhost:9097"
 	backendServers["B3"] = "localhost:9098"
-	setupForGet()
+	setup()
 	defer teardown()
 	b.ResetTimer()
 	for i := 1; i <= b.N; i++ {
 		res_chan = make(chan string, len(backendServers))
-		broadcast_res, status_code := httpGet("http://localhost:9090")
+		data := map[string]string{"index": strconv.Itoa(i)}
+		broadcast_res, status_code := httpGet("http://localhost:9090", data)
 		assertStatusCode(b, status_code, http.StatusOK)
-		assertForPrimaryResponse(b, broadcast_res)
+		assertForPrimaryResponse(b, broadcast_res, data)
 		waitForSecondaryResponses(res_chan)
 	}
 	assertMetric(b, b.N, "primary.success.count")
@@ -306,9 +301,14 @@ func assertStatusCode(tb testing.TB, expected_status_code, actual_status_code in
 	}
 }
 
-func assertForPrimaryResponse(tb testing.TB, response_str string) {
-	if primary_tag := readTag(response_str); primary_tag != PrimaryTag {
+func assertForPrimaryResponse(tb testing.TB, response_str string, data map[string]string) {
+	if primary_tag, message := parseResponse(response_str); primary_tag != PrimaryTag {
 		tb.Errorf("Expected primary tag %s, Actual primary tag %s. Broadcast Response %s", PrimaryTag, primary_tag, response_str)
+	} else {
+		expected_message := fmt.Sprintf("%v", data)
+		if expected_message != message {
+			tb.Errorf("Expected message '%s'. Actual message '%s'", expected_message, message)
+		}
 	}
 }
 
@@ -321,7 +321,6 @@ func waitForSecondaryResponses(res_chan <-chan string) {
 			timer.Reset(time.Duration(i) * time.Second)
 		case <-res_chan:
 			i++
-			// log.Printf("Response from backend server. Tag: %s. Response: %s\n", readTag(msg), msg)
 		}
 	}
 }
