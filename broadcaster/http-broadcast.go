@@ -22,10 +22,12 @@ type (
 )
 
 type BroadcastOptions struct {
-	Port            int         `yaml:"Port"`
-	PrimaryEndpoint string      `yaml:"PrimaryEndpoint"`
-	LogFile         string      `yaml:"LogFile"`
-	LogLevel        LoggerLevel `yaml:"EnableInfoLogs"`
+	Port                int         `yaml:"Port"`
+	PrimaryEndpoint     string      `yaml:"PrimaryEndpoint"`
+	LogFile             string      `yaml:"LogFile"`
+	LogLevel            LoggerLevel `yaml:"EnableInfoLogs"`
+	MaxIdleConns        int         `yaml:"MaxIdleConns"`
+	MaxIdleConnsPerHost int         `yaml:"MaxIdleConnsPerHost"`
 }
 
 type BroadcastConfig struct {
@@ -219,10 +221,12 @@ func newRequest(req *http.Request, req_body []byte, req_url *url.URL) *http.Requ
 	return new_req
 }
 
-func requestToBackend(req *http.Request, id EndPointId, endpoint *url.URL, reporter MetricsReporter, metricPrefix string) (*http.Response, error) {
+func requestToBackend(req *http.Request, id EndPointId, endpoint *url.URL, reporter MetricsReporter, metricPrefix string, options *BroadcastOptions) (*http.Response, error) {
 	tc := reporter.StartTiming()
 	defer reporter.EndTiming(tc, fmt.Sprintf("%s.response_time", metricPrefix))
 	transport := http.DefaultTransport
+	transport.(*http.Transport).MaxIdleConns = options.MaxIdleConns
+	transport.(*http.Transport).MaxIdleConnsPerHost = options.MaxIdleConnsPerHost
 	if res, err := transport.RoundTrip(req); err == nil {
 		go infoLog(fmt.Sprintf("Received response with status %d from [%s]:[%s]", res.StatusCode, id, endpoint))
 		go reporter.Increment(fmt.Sprintf("%s.success.count", metricPrefix))
@@ -282,7 +286,7 @@ func (b *Broadcaster) handler(rw http.ResponseWriter, req *http.Request) {
 	body := readRequestBody(req)
 	primary_request := newRequest(req, body, primary_backend)
 	go infoLog(fmt.Sprintf("Sending request to primary endpoint [%s]: %s", primary_endpoint_id, primary_request.URL.String()))
-	if res, err := requestToBackend(primary_request, primary_endpoint_id, b.config.primaryBackend, b.reporter, "primary"); err == nil {
+	if res, err := requestToBackend(primary_request, primary_endpoint_id, b.config.primaryBackend, b.reporter, "primary", b.config.Options); err == nil {
 		copyResponse(rw, res)
 	} else {
 		rw.WriteHeader(http.StatusServiceUnavailable)
@@ -294,7 +298,7 @@ func (b *Broadcaster) handler(rw http.ResponseWriter, req *http.Request) {
 			secondary_request := newRequest(req, body, secondary_backend)
 			infoLog(fmt.Sprintf("Sending request to secondary endpoint [%s]: %s", id, secondary_request.URL.String()))
 			go func() {
-				if res, _ := requestToBackend(secondary_request, id, secondary_backend, b.reporter, "secondary"); res != nil {
+				if res, _ := requestToBackend(secondary_request, id, secondary_backend, b.reporter, "secondary", b.config.Options); res != nil {
 					logResponse(res)
 				}
 			}()
