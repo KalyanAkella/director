@@ -1,8 +1,9 @@
 package main
 
 import (
-	"go-broadcaster/broadcaster"
 	"log"
+
+	"github.com/KalyanAkella/director/broadcaster"
 )
 
 func main() {
