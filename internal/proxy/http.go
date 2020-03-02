@@ -1,4 +1,4 @@
-package broadcaster
+package proxy
 
 import (
 	"bufio"
@@ -21,7 +21,7 @@ type (
 	LoggerLevel = bool
 )
 
-type BroadcastOptions struct {
+type ProxyOptions struct {
 	Port                int         `yaml:"Port"`
 	PrimaryEndpoint     string      `yaml:"PrimaryEndpoint"`
 	LogFile             string      `yaml:"LogFile"`
@@ -30,9 +30,9 @@ type BroadcastOptions struct {
 	MaxIdleConnsPerHost int         `yaml:"MaxIdleConnsPerHost"`
 }
 
-type BroadcastConfig struct {
-	Options           *BroadcastOptions `yaml:"Options,omitempty"`
-	Backends          EndPoints         `yaml:"Backends,omitempty"`
+type ProxyConfig struct {
+	Options           *ProxyOptions `yaml:"Options,omitempty"`
+	Backends          EndPoints     `yaml:"Backends,omitempty"`
 	primaryBackend    *url.URL
 	secondaryBackends map[EndPointId]*url.URL
 }
@@ -94,44 +94,44 @@ func (r *NoOpReporter) Count(tag string, value interface{})     {}
 func (r *NoOpReporter) Time(tag string)                         {}
 func (r *NoOpReporter) EndTiming(tc *TimingContext, tag string) {}
 
-type Broadcaster struct {
+type Director struct {
 	Handler  http.HandlerFunc
 	reporter MetricsReporter
-	config   *BroadcastConfig
+	config   *ProxyConfig
 }
 
-func broadcastError(msg string) error {
-	return fmt.Errorf("[HTTP Broadcast] %s", msg)
+func proxyError(msg string) error {
+	return fmt.Errorf("[HTTP Proxy] %s", msg)
 }
 
-func validate(config *BroadcastConfig) error {
+func validate(config *ProxyConfig) error {
 	if config == nil {
-		return broadcastError("Configuration for broadcast must be provided")
+		return proxyError("Configuration for proxy must be provided")
 	}
 	if config.Options == nil {
-		return broadcastError("Broadcast options are missing")
+		return proxyError("Proxy options are missing")
 	}
 	configureLogger(config.Options)
 	if config.Options.Port == 0 {
-		return broadcastError("Broadcast port is missing in broadcast options")
+		return proxyError("Proxy port is missing in proxy options")
 	}
 	if config.Options.PrimaryEndpoint == "" {
-		return broadcastError("Primary endpoint is missing in broadcast options")
+		return proxyError("Primary endpoint is missing in proxy options")
 	}
 	if config.Backends == nil || len(config.Backends) == 0 {
-		return broadcastError("Backends are missing or empty")
+		return proxyError("Backends are missing or empty")
 	} else {
 		config.secondaryBackends = make(map[EndPointId]*url.URL)
 	}
 	if _, present := config.Backends[config.Options.PrimaryEndpoint]; !present {
-		return broadcastError("Primary backend missing from the given set of backends")
+		return proxyError("Primary backend missing from the given set of backends")
 	}
 	for k, v := range config.Backends {
 		if v == "" {
-			return broadcastError(fmt.Sprintf("Backend endpoint with ID: %s does not have any associated data", k))
+			return proxyError(fmt.Sprintf("Backend endpoint with ID: %s does not have any associated data", k))
 		} else {
 			if backend_url, err := url.Parse(v); err != nil {
-				return broadcastError(fmt.Sprintf("Invalid url: %s for endpoint with ID: %s. Error: %s", v, k, err.Error()))
+				return proxyError(fmt.Sprintf("Invalid url: %s for endpoint with ID: %s. Error: %s", v, k, err.Error()))
 			} else {
 				if k == config.Options.PrimaryEndpoint {
 					config.primaryBackend = backend_url
@@ -154,11 +154,11 @@ func cloneHeader(h http.Header) http.Header {
 	return h2
 }
 
-func configureLogger(options *BroadcastOptions) {
+func configureLogger(options *ProxyOptions) {
 	currentLogLevel = options.LogLevel
-	broadcastLogFile := options.LogFile
-	if broadcastLogFile != "" {
-		if logFile, err := os.OpenFile(broadcastLogFile, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644); err == nil {
+	proxyLogFile := options.LogFile
+	if proxyLogFile != "" {
+		if logFile, err := os.OpenFile(proxyLogFile, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644); err == nil {
 			logger.SetOutput(logFile)
 		} else {
 			errorLog(err.Error())
@@ -178,7 +178,7 @@ func singleJoiningSlash(a, b string) string {
 	return a + b
 }
 
-func modifyRequestForBroadcast(out_req *http.Request, target *url.URL) {
+func modifyRequestForProxy(out_req *http.Request, target *url.URL) {
 	targetQuery := target.RawQuery
 	out_req.URL.Scheme = target.Scheme
 	out_req.URL.Host = target.Host
@@ -201,7 +201,7 @@ func newRequest(req *http.Request, req_body []byte, req_url *url.URL) *http.Requ
 	new_req.ContentLength = int64(len(req_body))
 	new_req.Body = ioutil.NopCloser(bytes.NewReader(req_body))
 	new_req.Header = cloneHeader(req.Header)
-	modifyRequestForBroadcast(new_req, req_url)
+	modifyRequestForProxy(new_req, req_url)
 	new_req.Close = false
 
 	for _, h := range hopHeaders {
@@ -221,7 +221,7 @@ func newRequest(req *http.Request, req_body []byte, req_url *url.URL) *http.Requ
 	return new_req
 }
 
-func requestToBackend(req *http.Request, id EndPointId, endpoint *url.URL, reporter MetricsReporter, metricPrefix string, options *BroadcastOptions) (*http.Response, error) {
+func requestToBackend(req *http.Request, id EndPointId, endpoint *url.URL, reporter MetricsReporter, metricPrefix string, options *ProxyOptions) (*http.Response, error) {
 	tc := reporter.StartTiming()
 	defer reporter.EndTiming(tc, fmt.Sprintf("%s.response_time", metricPrefix))
 	transport := http.DefaultTransport
@@ -277,8 +277,8 @@ func readRequestBody(req *http.Request) []byte {
 	}
 }
 
-func (b *Broadcaster) handler(rw http.ResponseWriter, req *http.Request) {
-	go b.reporter.Increment("broadcaster.request.count")
+func (b *Director) handler(rw http.ResponseWriter, req *http.Request) {
+	go b.reporter.Increment("director.request.count")
 	go infoLog("Received request: " + req.URL.String())
 
 	primary_endpoint_id := b.config.Options.PrimaryEndpoint
@@ -306,24 +306,24 @@ func (b *Broadcaster) handler(rw http.ResponseWriter, req *http.Request) {
 	}()
 }
 
-func NewBroadcaster(broadcastConfig *BroadcastConfig) (*Broadcaster, error) {
-	if err := validate(broadcastConfig); err != nil {
+func NewDirector(proxyConfig *ProxyConfig) (*Director, error) {
+	if err := validate(proxyConfig); err != nil {
 		return nil, err
 	}
-	broadcaster := &Broadcaster{
+	director := &Director{
 		reporter: &NoOpReporter{},
-		config:   broadcastConfig,
+		config:   proxyConfig,
 	}
-	broadcaster.Handler = http.HandlerFunc(broadcaster.handler)
-	return broadcaster, nil
+	director.Handler = http.HandlerFunc(director.handler)
+	return director, nil
 }
 
-func (b *Broadcaster) WithMetricsReporter(reporter MetricsReporter) {
+func (b *Director) WithMetricsReporter(reporter MetricsReporter) {
 	if reporter != nil {
 		b.reporter = reporter
 	}
 }
 
-func (b *Broadcaster) ListenAndServe() error {
+func (b *Director) ListenAndServe() error {
 	return http.ListenAndServe(fmt.Sprintf(":%d", b.config.Options.Port), b.Handler)
 }

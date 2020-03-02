@@ -3,23 +3,23 @@ package main
 import (
 	"log"
 
-	"github.com/KalyanAkella/director/broadcaster"
+	"github.com/KalyanAkella/director/internal/proxy"
 )
 
 func main() {
-	if broadcaster, err := broadcaster.NewBroadcaster(&broadcaster.BroadcastConfig{
+	if director, err := proxy.NewDirector(&proxy.ProxyConfig{
 		Backends: map[string]string{
 			"1": "http://localhost:9091",
 			"2": "http://localhost:9092",
 		},
-		Options: &broadcaster.BroadcastOptions{
+		Options: &proxy.ProxyOptions{
 			Port:            8080,
 			PrimaryEndpoint: "1",
-			LogLevel:        broadcaster.INFO,
+			LogLevel:        proxy.INFO,
 		},
 	}); err != nil {
 		log.Fatal(err)
 	} else {
-		log.Fatal(broadcaster.ListenAndServe())
+		log.Fatal(director.ListenAndServe())
 	}
 }

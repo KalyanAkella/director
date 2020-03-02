@@ -1,4 +1,4 @@
-package broadcaster
+package proxy
 
 import (
 	"fmt"
@@ -56,9 +56,9 @@ func newListener(endpoint string) net.Listener {
 	}
 }
 
-func newBroadcastServer(handler http.HandlerFunc) *httptest.Server {
+func newDirectorServer(handler http.HandlerFunc) *httptest.Server {
 	aServer := httptest.NewUnstartedServer(handler)
-	aServer.Listener = newListener(fmt.Sprintf("localhost:%d", BroadcastServerPort))
+	aServer.Listener = newListener(fmt.Sprintf("localhost:%d", DirectorServerPort))
 	aServer.Start()
 	return aServer
 }
@@ -104,9 +104,9 @@ func newServer(tag, endpoint string) *httptest.Server {
 }
 
 const (
-	PrimaryTag          = "B2"
-	BroadcastServerPort = 9090
-	NumRequests         = 10
+	PrimaryTag         = "B2"
+	DirectorServerPort = 9090
+	NumRequests        = 10
 )
 
 func parseResponse(response string) (string, string) {
@@ -167,7 +167,7 @@ func httpGet(httpUrl string, data map[string]string) (string, int) {
 	}
 }
 
-var broadcast_server *httptest.Server
+var proxy_server *httptest.Server
 var res_chan chan string
 var backends map[string]*httptest.Server
 var backendServers map[string]string
@@ -180,15 +180,15 @@ func startBackendServers() {
 	}
 }
 
-func startBroadcastServer() {
+func startDirectorServer() {
 	servers := make(map[string]string, len(backendServers))
 	for t, e := range backendServers {
 		servers[t] = fmt.Sprintf("http://%s", e)
 	}
-	if broadcaster, err := NewBroadcaster(&BroadcastConfig{
+	if director, err := NewDirector(&ProxyConfig{
 		Backends: servers,
-		Options: &BroadcastOptions{
-			Port:            BroadcastServerPort,
+		Options: &ProxyOptions{
+			Port:            DirectorServerPort,
 			PrimaryEndpoint: PrimaryTag,
 			LogLevel:        ERROR,
 		},
@@ -196,18 +196,18 @@ func startBroadcastServer() {
 		log.Fatal(err)
 	} else {
 		reporter = &Reporter{metrics: make(map[string]uint64)}
-		broadcaster.WithMetricsReporter(reporter)
-		broadcast_server = newBroadcastServer(broadcaster.Handler)
+		director.WithMetricsReporter(reporter)
+		proxy_server = newDirectorServer(director.Handler)
 	}
 }
 
 func setup() {
 	startBackendServers()
-	startBroadcastServer()
+	startDirectorServer()
 }
 
 func teardown() {
-	shutdownBackend(broadcast_server)
+	shutdownBackend(proxy_server)
 	for _, backend := range backends {
 		shutdownBackend(backend)
 	}
@@ -224,7 +224,7 @@ func assertMetric(tb testing.TB, expected_value int, metric_name string) {
 	}
 }
 
-func TestHTTPGetBroadcastWithFailureResponse(t *testing.T) {
+func TestHTTPGetWithFailureResponse(t *testing.T) {
 	backendServers = make(map[string]string)
 	backendServers["B1"] = "localhost:9094"
 	backendServers[PrimaryTag] = "localhost:9095"
@@ -234,10 +234,10 @@ func TestHTTPGetBroadcastWithFailureResponse(t *testing.T) {
 	_, status_code := httpGet("http://localhost:9090", map[string]string{})
 	assertStatusCode(t, status_code, http.StatusServiceUnavailable)
 	assertMetric(t, 1, "primary.failure.count")
-	assertMetric(t, 1, "broadcaster.request.count")
+	assertMetric(t, 1, "director.request.count")
 }
 
-func TestHTTPPostBroadcastWithSuccessResponse(t *testing.T) {
+func TestHTTPPostWithSuccessResponse(t *testing.T) {
 	backendServers = make(map[string]string)
 	backendServers["B1"] = "localhost:8091"
 	backendServers[PrimaryTag] = "localhost:8092"
@@ -247,16 +247,16 @@ func TestHTTPPostBroadcastWithSuccessResponse(t *testing.T) {
 	for i := 1; i <= NumRequests; i++ {
 		res_chan = make(chan string, len(backendServers))
 		data := map[string]string{"index": strconv.Itoa(i)}
-		broadcast_res, status_code := httpPost("http://localhost:9090", data)
+		director_res, status_code := httpPost("http://localhost:9090", data)
 		assertStatusCode(t, status_code, http.StatusOK)
-		assertForPrimaryResponse(t, broadcast_res, data)
+		assertForPrimaryResponse(t, director_res, data)
 		waitForSecondaryResponses(res_chan)
 	}
 	assertMetric(t, NumRequests, "primary.success.count")
-	assertMetric(t, NumRequests, "broadcaster.request.count")
+	assertMetric(t, NumRequests, "director.request.count")
 }
 
-func TestHTTPGetBroadcastWithSuccessResponse(t *testing.T) {
+func TestHTTPGetWithSuccessResponse(t *testing.T) {
 	backendServers = make(map[string]string)
 	backendServers["B1"] = "localhost:9091"
 	backendServers[PrimaryTag] = "localhost:9092"
@@ -266,16 +266,16 @@ func TestHTTPGetBroadcastWithSuccessResponse(t *testing.T) {
 	for i := 1; i <= NumRequests; i++ {
 		res_chan = make(chan string, len(backendServers))
 		data := map[string]string{"index": strconv.Itoa(i)}
-		broadcast_res, status_code := httpGet("http://localhost:9090", data)
+		director_res, status_code := httpGet("http://localhost:9090", data)
 		assertStatusCode(t, status_code, http.StatusOK)
-		assertForPrimaryResponse(t, broadcast_res, data)
+		assertForPrimaryResponse(t, director_res, data)
 		waitForSecondaryResponses(res_chan)
 	}
 	assertMetric(t, NumRequests, "primary.success.count")
-	assertMetric(t, NumRequests, "broadcaster.request.count")
+	assertMetric(t, NumRequests, "director.request.count")
 }
 
-func BenchmarkHTTPGetBroadcast(b *testing.B) {
+func BenchmarkHTTPGet(b *testing.B) {
 	backendServers = make(map[string]string)
 	backendServers["B1"] = "localhost:9096"
 	backendServers[PrimaryTag] = "localhost:9097"
@@ -286,13 +286,13 @@ func BenchmarkHTTPGetBroadcast(b *testing.B) {
 	for i := 1; i <= b.N; i++ {
 		res_chan = make(chan string, len(backendServers))
 		data := map[string]string{"index": strconv.Itoa(i)}
-		broadcast_res, status_code := httpGet("http://localhost:9090", data)
+		director_res, status_code := httpGet("http://localhost:9090", data)
 		assertStatusCode(b, status_code, http.StatusOK)
-		assertForPrimaryResponse(b, broadcast_res, data)
+		assertForPrimaryResponse(b, director_res, data)
 		waitForSecondaryResponses(res_chan)
 	}
 	assertMetric(b, b.N, "primary.success.count")
-	assertMetric(b, b.N, "broadcaster.request.count")
+	assertMetric(b, b.N, "director.request.count")
 }
 
 func assertStatusCode(tb testing.TB, expected_status_code, actual_status_code int) {
@@ -303,7 +303,7 @@ func assertStatusCode(tb testing.TB, expected_status_code, actual_status_code in
 
 func assertForPrimaryResponse(tb testing.TB, response_str string, data map[string]string) {
 	if primary_tag, message := parseResponse(response_str); primary_tag != PrimaryTag {
-		tb.Errorf("Expected primary tag %s, Actual primary tag %s. Broadcast Response %s", PrimaryTag, primary_tag, response_str)
+		tb.Errorf("Expected primary tag %s, Actual primary tag %s. Director Response %s", PrimaryTag, primary_tag, response_str)
 	} else {
 		expected_message := fmt.Sprintf("%v", data)
 		if expected_message != message {
