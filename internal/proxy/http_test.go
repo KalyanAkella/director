@@ -12,6 +12,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/KalyanAkella/director/internal/metrics"
 )
 
 type Reporter struct {
@@ -37,9 +39,9 @@ func (r *Reporter) Count(tag string, value interface{}) {
 	r.metrics[tag] += value.(uint64)
 }
 
-func (r *Reporter) StartTiming() *TimingContext { return nil }
+func (r *Reporter) StartTiming() *metrics.TimingContext { return nil }
 
-func (r *Reporter) EndTiming(tc *TimingContext, tag string) {}
+func (r *Reporter) EndTiming(tc *metrics.TimingContext, tag string) {}
 
 func (r *Reporter) Reset() {
 	r.m.Lock()
@@ -196,7 +198,7 @@ func startDirectorServer() {
 		log.Fatal(err)
 	} else {
 		reporter = &Reporter{metrics: make(map[string]uint64)}
-		director.WithMetricsReporter(reporter)
+		director.reporter = reporter
 		proxy_server = newDirectorServer(director.handler)
 	}
 }

@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"gopkg.in/alexcesaro/statsd.v2"
 	"io"
 	"io/ioutil"
 	"log"
@@ -13,6 +12,8 @@ import (
 	"net/url"
 	"os"
 	"strings"
+
+	"github.com/KalyanAkella/director/internal/metrics"
 )
 
 type LoggerLevel bool
@@ -29,6 +30,7 @@ type ProxyOptions struct {
 	LogLevel        LoggerLevel `yaml:"EnableInfoLogs"`
 	EnableStatsD    bool        `yaml:"EnableStatsD"`
 	StatsDService   string      `yaml:"StatsDService"`
+	metricsReporter metrics.Reporter
 }
 
 type ProxyConfig struct {
@@ -69,69 +71,6 @@ var (
 	}
 )
 
-type TimingContext struct {
-	Context interface{}
-}
-
-type MetricsReporter interface {
-	Increment(tag string)
-	Gauge(tag string, value interface{})
-	Count(tag string, value interface{})
-	StartTiming() *TimingContext
-	EndTiming(tc *TimingContext, tag string)
-}
-
-type noopReporter struct{}
-
-func (r *noopReporter) StartTiming() *TimingContext             { return nil }
-func (r *noopReporter) Increment(tag string)                    {}
-func (r *noopReporter) Gauge(tag string, value interface{})     {}
-func (r *noopReporter) Count(tag string, value interface{})     {}
-func (r *noopReporter) Time(tag string)                         {}
-func (r *noopReporter) EndTiming(tc *TimingContext, tag string) {}
-
-type statsDReporter struct {
-	client *statsd.Client
-}
-
-func (r *statsDReporter) handleStatsDFailure(operation string) {
-	if err := recover(); err != nil {
-		errorLog(fmt.Sprintf("StatsD error for %s. Error: %v\n", operation, err))
-	}
-}
-
-func (r *statsDReporter) Close() {
-	defer r.handleStatsDFailure("Close")
-	r.client.Close()
-}
-
-func (r *statsDReporter) Increment(tag string) {
-	defer r.handleStatsDFailure("Increment")
-	r.client.Increment(tag)
-}
-
-func (r *statsDReporter) Gauge(tag string, value interface{}) {
-	defer r.handleStatsDFailure("Gauge")
-	r.client.Gauge(tag, value)
-}
-
-func (r *statsDReporter) Count(tag string, value interface{}) {
-	defer r.handleStatsDFailure("Count")
-	r.client.Count(tag, value)
-}
-
-func (r *statsDReporter) StartTiming() *TimingContext {
-	defer r.handleStatsDFailure("StartTiming")
-	return &TimingContext{Context: r.client.NewTiming()}
-}
-
-func (r *statsDReporter) EndTiming(tc *TimingContext, tag string) {
-	defer r.handleStatsDFailure("EndTiming")
-	if tc.Context != nil {
-		tc.Context.(statsd.Timing).Send(tag)
-	}
-}
-
 type backend struct {
 	id   string
 	addr *url.URL
@@ -139,13 +78,19 @@ type backend struct {
 
 type director struct {
 	port        int
-	reporter    MetricsReporter
+	reporter    metrics.Reporter
 	primary     *backend
 	secondaries []*backend
 }
 
 func proxyError(msg string) error {
 	return fmt.Errorf("[HTTP Proxy] %s", msg)
+}
+
+func handleStatsDFailure(operation string) {
+	if err := recover(); err != nil {
+		errorLog(fmt.Sprintf("StatsD error for %s. Error: %v\n", operation, err))
+	}
 }
 
 func validate(config *ProxyConfig) error {
@@ -159,8 +104,14 @@ func validate(config *ProxyConfig) error {
 	if config.Options.Port == 0 {
 		return proxyError("Proxy port is missing in proxy options")
 	}
-	if config.Options.EnableStatsD && config.Options.StatsDService == "" {
-		return proxyError("StatsD service address (host:port) must be given if StatsD is enabled")
+	if config.Options.EnableStatsD {
+		if metricsReporter, err := metrics.NewStatsDReporter("director", config.Options.StatsDService, handleStatsDFailure); err != nil {
+			return proxyError(fmt.Sprintf("Unable to configure StatsD client. Error: %s", err.Error()))
+		} else {
+			config.Options.metricsReporter = metricsReporter
+		}
+	} else {
+		config.Options.metricsReporter = metrics.NewNoopReporter()
 	}
 	if config.Options.PrimaryEndpoint == "" {
 		return proxyError("Primary endpoint is missing in proxy options")
@@ -268,7 +219,7 @@ func newRequest(req *http.Request, req_body []byte, req_url *url.URL) *http.Requ
 
 const MaxIdleConnsPerHost = 100
 
-func requestToBackend(req *http.Request, be *backend, reporter MetricsReporter, metricPrefix string) (*http.Response, error) {
+func requestToBackend(req *http.Request, be *backend, reporter metrics.Reporter, metricPrefix string) (*http.Response, error) {
 	tc := reporter.StartTiming()
 	defer reporter.EndTiming(tc, fmt.Sprintf("%s.response_time", metricPrefix))
 	transport := http.DefaultTransport
@@ -358,16 +309,10 @@ func NewDirector(proxyConfig *ProxyConfig) (*director, error) {
 	}
 	return &director{
 		port:        proxyConfig.Options.Port,
-		reporter:    &noopReporter{},
+		reporter:    proxyConfig.Options.metricsReporter,
 		primary:     proxyConfig.primary,
 		secondaries: proxyConfig.secondaries,
 	}, nil
-}
-
-func (b *director) WithMetricsReporter(reporter MetricsReporter) {
-	if reporter != nil {
-		b.reporter = reporter
-	}
 }
 
 func (b *director) ListenAndServe() error {
