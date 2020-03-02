@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"gopkg.in/alexcesaro/statsd.v2"
 	"io"
 	"io/ioutil"
 	"log"
@@ -14,33 +15,28 @@ import (
 	"strings"
 )
 
-type (
-	EndPointId  = string
-	EndPoint    = string
-	EndPoints   = map[EndPointId]EndPoint
-	LoggerLevel = bool
-)
-
-type ProxyOptions struct {
-	Port                int         `yaml:"Port"`
-	PrimaryEndpoint     string      `yaml:"PrimaryEndpoint"`
-	LogFile             string      `yaml:"LogFile"`
-	LogLevel            LoggerLevel `yaml:"EnableInfoLogs"`
-	MaxIdleConns        int         `yaml:"MaxIdleConns"`
-	MaxIdleConnsPerHost int         `yaml:"MaxIdleConnsPerHost"`
-}
-
-type ProxyConfig struct {
-	Options           *ProxyOptions `yaml:"Options,omitempty"`
-	Backends          EndPoints     `yaml:"Backends,omitempty"`
-	primaryBackend    *url.URL
-	secondaryBackends map[EndPointId]*url.URL
-}
+type LoggerLevel bool
 
 const (
 	ERROR LoggerLevel = false
 	INFO  LoggerLevel = true
 )
+
+type ProxyOptions struct {
+	Port            int         `yaml:"Port"`
+	PrimaryEndpoint string      `yaml:"PrimaryEndpoint"`
+	LogFile         string      `yaml:"LogFile"`
+	LogLevel        LoggerLevel `yaml:"EnableInfoLogs"`
+	EnableStatsD    bool        `yaml:"EnableStatsD"`
+	StatsDService   string      `yaml:"StatsDService"`
+}
+
+type ProxyConfig struct {
+	Options     *ProxyOptions     `yaml:"Options,omitempty"`
+	Backends    map[string]string `yaml:"Backends,omitempty"`
+	primary     *backend
+	secondaries []*backend
+}
 
 var (
 	currentLogLevel = ERROR
@@ -85,19 +81,67 @@ type MetricsReporter interface {
 	EndTiming(tc *TimingContext, tag string)
 }
 
-type NoOpReporter struct{}
+type noopReporter struct{}
 
-func (r *NoOpReporter) StartTiming() *TimingContext             { return nil }
-func (r *NoOpReporter) Increment(tag string)                    {}
-func (r *NoOpReporter) Gauge(tag string, value interface{})     {}
-func (r *NoOpReporter) Count(tag string, value interface{})     {}
-func (r *NoOpReporter) Time(tag string)                         {}
-func (r *NoOpReporter) EndTiming(tc *TimingContext, tag string) {}
+func (r *noopReporter) StartTiming() *TimingContext             { return nil }
+func (r *noopReporter) Increment(tag string)                    {}
+func (r *noopReporter) Gauge(tag string, value interface{})     {}
+func (r *noopReporter) Count(tag string, value interface{})     {}
+func (r *noopReporter) Time(tag string)                         {}
+func (r *noopReporter) EndTiming(tc *TimingContext, tag string) {}
 
-type Director struct {
-	Handler  http.HandlerFunc
-	reporter MetricsReporter
-	config   *ProxyConfig
+type statsDReporter struct {
+	client *statsd.Client
+}
+
+func (r *statsDReporter) handleStatsDFailure(operation string) {
+	if err := recover(); err != nil {
+		errorLog(fmt.Sprintf("StatsD error for %s. Error: %v\n", operation, err))
+	}
+}
+
+func (r *statsDReporter) Close() {
+	defer r.handleStatsDFailure("Close")
+	r.client.Close()
+}
+
+func (r *statsDReporter) Increment(tag string) {
+	defer r.handleStatsDFailure("Increment")
+	r.client.Increment(tag)
+}
+
+func (r *statsDReporter) Gauge(tag string, value interface{}) {
+	defer r.handleStatsDFailure("Gauge")
+	r.client.Gauge(tag, value)
+}
+
+func (r *statsDReporter) Count(tag string, value interface{}) {
+	defer r.handleStatsDFailure("Count")
+	r.client.Count(tag, value)
+}
+
+func (r *statsDReporter) StartTiming() *TimingContext {
+	defer r.handleStatsDFailure("StartTiming")
+	return &TimingContext{Context: r.client.NewTiming()}
+}
+
+func (r *statsDReporter) EndTiming(tc *TimingContext, tag string) {
+	defer r.handleStatsDFailure("EndTiming")
+	if tc.Context != nil {
+		tc.Context.(statsd.Timing).Send(tag)
+	}
+}
+
+type backend struct {
+	id   string
+	addr *url.URL
+}
+
+type director struct {
+	port        int
+	reporter    MetricsReporter
+	primary     *backend
+	secondaries []*backend
 }
 
 func proxyError(msg string) error {
@@ -115,13 +159,14 @@ func validate(config *ProxyConfig) error {
 	if config.Options.Port == 0 {
 		return proxyError("Proxy port is missing in proxy options")
 	}
+	if config.Options.EnableStatsD && config.Options.StatsDService == "" {
+		return proxyError("StatsD service address (host:port) must be given if StatsD is enabled")
+	}
 	if config.Options.PrimaryEndpoint == "" {
 		return proxyError("Primary endpoint is missing in proxy options")
 	}
 	if config.Backends == nil || len(config.Backends) == 0 {
 		return proxyError("Backends are missing or empty")
-	} else {
-		config.secondaryBackends = make(map[EndPointId]*url.URL)
 	}
 	if _, present := config.Backends[config.Options.PrimaryEndpoint]; !present {
 		return proxyError("Primary backend missing from the given set of backends")
@@ -134,9 +179,9 @@ func validate(config *ProxyConfig) error {
 				return proxyError(fmt.Sprintf("Invalid url: %s for endpoint with ID: %s. Error: %s", v, k, err.Error()))
 			} else {
 				if k == config.Options.PrimaryEndpoint {
-					config.primaryBackend = backend_url
+					config.primary = &backend{k, backend_url}
 				} else {
-					config.secondaryBackends[k] = backend_url
+					config.secondaries = append(config.secondaries, &backend{k, backend_url})
 				}
 			}
 		}
@@ -221,19 +266,21 @@ func newRequest(req *http.Request, req_body []byte, req_url *url.URL) *http.Requ
 	return new_req
 }
 
-func requestToBackend(req *http.Request, id EndPointId, endpoint *url.URL, reporter MetricsReporter, metricPrefix string, options *ProxyOptions) (*http.Response, error) {
+const MaxIdleConnsPerHost = 100
+
+func requestToBackend(req *http.Request, be *backend, reporter MetricsReporter, metricPrefix string) (*http.Response, error) {
 	tc := reporter.StartTiming()
 	defer reporter.EndTiming(tc, fmt.Sprintf("%s.response_time", metricPrefix))
 	transport := http.DefaultTransport
-	transport.(*http.Transport).MaxIdleConns = options.MaxIdleConns
-	transport.(*http.Transport).MaxIdleConnsPerHost = options.MaxIdleConnsPerHost
+	//transport.(*http.Transport).MaxIdleConns = MaxIdleConns /* do NOT set for unlimited idle conns */
+	transport.(*http.Transport).MaxIdleConnsPerHost = MaxIdleConnsPerHost
 	if res, err := transport.RoundTrip(req); err == nil {
-		go infoLog(fmt.Sprintf("Received response with status %d from [%s]:[%s]", res.StatusCode, id, endpoint))
+		go infoLog(fmt.Sprintf("Received response with status %d from [%s]:[%s]", res.StatusCode, be.id, be.addr))
 		go reporter.Increment(fmt.Sprintf("%s.success.count", metricPrefix))
 		return res, nil
 	} else {
 		go reporter.Increment(fmt.Sprintf("%s.failure.count", metricPrefix))
-		go errorLog(fmt.Sprintf("Error response from [%s]:[%s] -> %s", id, endpoint, err.Error()))
+		go errorLog(fmt.Sprintf("Error response from [%s]:[%s] -> %s", be.id, be.addr, err.Error()))
 		return nil, err
 	}
 }
@@ -277,16 +324,15 @@ func readRequestBody(req *http.Request) []byte {
 	}
 }
 
-func (b *Director) handler(rw http.ResponseWriter, req *http.Request) {
+func (b *director) handler(rw http.ResponseWriter, req *http.Request) {
 	go b.reporter.Increment("director.request.count")
 	go infoLog("Received request: " + req.URL.String())
 
-	primary_endpoint_id := b.config.Options.PrimaryEndpoint
-	primary_backend := b.config.primaryBackend
+	primary_backend := b.primary
 	body := readRequestBody(req)
-	primary_request := newRequest(req, body, primary_backend)
-	go infoLog(fmt.Sprintf("Sending request to primary endpoint [%s]: %s", primary_endpoint_id, primary_request.URL.String()))
-	if res, err := requestToBackend(primary_request, primary_endpoint_id, b.config.primaryBackend, b.reporter, "primary", b.config.Options); err == nil {
+	primary_request := newRequest(req, body, primary_backend.addr)
+	go infoLog(fmt.Sprintf("Sending request to primary endpoint [%s]: %s", primary_backend.id, primary_request.URL.String()))
+	if res, err := requestToBackend(primary_request, primary_backend, b.reporter, "primary"); err == nil {
 		copyResponse(rw, res)
 	} else {
 		rw.WriteHeader(http.StatusServiceUnavailable)
@@ -294,11 +340,11 @@ func (b *Director) handler(rw http.ResponseWriter, req *http.Request) {
 	}
 
 	go func() {
-		for id, secondary_backend := range b.config.secondaryBackends {
-			secondary_request := newRequest(req, body, secondary_backend)
-			infoLog(fmt.Sprintf("Sending request to secondary endpoint [%s]: %s", id, secondary_request.URL.String()))
+		for _, secondary_backend := range b.secondaries {
+			secondary_request := newRequest(req, body, secondary_backend.addr)
+			infoLog(fmt.Sprintf("Sending request to secondary endpoint [%s]: %s", secondary_backend.id, secondary_request.URL.String()))
 			go func() {
-				if res, _ := requestToBackend(secondary_request, id, secondary_backend, b.reporter, "secondary", b.config.Options); res != nil {
+				if res, _ := requestToBackend(secondary_request, secondary_backend, b.reporter, "secondary"); res != nil {
 					logResponse(res)
 				}
 			}()
@@ -306,24 +352,24 @@ func (b *Director) handler(rw http.ResponseWriter, req *http.Request) {
 	}()
 }
 
-func NewDirector(proxyConfig *ProxyConfig) (*Director, error) {
+func NewDirector(proxyConfig *ProxyConfig) (*director, error) {
 	if err := validate(proxyConfig); err != nil {
 		return nil, err
 	}
-	director := &Director{
-		reporter: &NoOpReporter{},
-		config:   proxyConfig,
-	}
-	director.Handler = http.HandlerFunc(director.handler)
-	return director, nil
+	return &director{
+		port:        proxyConfig.Options.Port,
+		reporter:    &noopReporter{},
+		primary:     proxyConfig.primary,
+		secondaries: proxyConfig.secondaries,
+	}, nil
 }
 
-func (b *Director) WithMetricsReporter(reporter MetricsReporter) {
+func (b *director) WithMetricsReporter(reporter MetricsReporter) {
 	if reporter != nil {
 		b.reporter = reporter
 	}
 }
 
-func (b *Director) ListenAndServe() error {
-	return http.ListenAndServe(fmt.Sprintf(":%d", b.config.Options.Port), b.Handler)
+func (b *director) ListenAndServe() error {
+	return http.ListenAndServe(fmt.Sprintf(":%d", b.port), http.HandlerFunc(b.handler))
 }

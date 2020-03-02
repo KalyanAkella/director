@@ -1,0 +1,10 @@
+Options:
+  Port: 30303
+  PrimaryEndpoint: "1"
+  LogFile: "/tmp/director/proxy.log"
+  EnableInfoLogs: false
+  EnableStatsD: true
+  StatsDService: "127.0.0.1:8125"
+Backends:
+  "1": http://127.0.0.1:50505
+  "2": http://127.0.0.1:51515

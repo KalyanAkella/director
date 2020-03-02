@@ -197,7 +197,7 @@ func startDirectorServer() {
 	} else {
 		reporter = &Reporter{metrics: make(map[string]uint64)}
 		director.WithMetricsReporter(reporter)
-		proxy_server = newDirectorServer(director.Handler)
+		proxy_server = newDirectorServer(director.handler)
 	}
 }
 
